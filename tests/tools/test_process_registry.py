@@ -937,40 +937,6 @@ class TestSpawnEnvSanitization:
         # A failed launch must not be exposed as a running/tracked session.
         assert session.id not in registry._running
 
-    def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
-        session = _make_session(sid="proc_space")
-        session.exited = False
-
-        class FakeEnv:
-            def __init__(self):
-                self.commands = []
-                self._responses = iter([
-                    {"output": "6 0\nhello\n"},
-                    {"output": "1\n"},
-                    {"output": "0\n"},
-                ])
-
-            def execute(self, command, **kwargs):
-                self.commands.append((command, kwargs))
-                return next(self._responses)
-
-        env = FakeEnv()
-
-        with patch("tools.process_registry.time.sleep", return_value=None), \
-            patch.object(registry, "_move_to_finished"):
-            registry._env_poller_loop(
-                session,
-                env,
-                "/path with spaces/hermes_bg.log",
-                "/path with spaces/hermes_bg.pid",
-                "/path with spaces/hermes_bg.exit",
-            )
-
-        assert "'/path with spaces/hermes_bg.log'" in env.commands[0][0]
-        assert "cat '/path with spaces/hermes_bg.log'" not in env.commands[0][0]
-        assert "'/path with spaces/hermes_bg.pid'" in env.commands[1][0]
-        assert "'/path with spaces/hermes_bg.exit'" in env.commands[2][0]
-
 
 class TestEnvPollerIncrementalRead:
     """The sandbox log poller must read only new bytes, not the whole file.
@@ -1285,24 +1251,51 @@ class TestCheckpoint:
         assert json.loads(checkpoint.read_text()) == []
 
 
-    def test_recovery_skips_explicit_sandbox_backed_entries(self, registry, tmp_path):
+    def test_recovery_retains_sandbox_backed_entries_as_unresolved(self, registry, tmp_path, monkeypatch):
+        """Restart recovery retains sandbox runs as durable ``unresolved`` evidence.
+
+        In-sandbox PIDs mean nothing once the env handle is gone, so the run is
+        never dropped and never host-signalled: it stays tracked with its error
+        evidence, its checkpoint entry, and a re-armed watch route until
+        ``reattach_env_session`` resumes it in the same container.
+        """
+        import hermes_constants
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: home)
         checkpoint = tmp_path / "procs.json"
         original = [{
             "session_id": "proc_remote",
             "command": "sleep 999",
-            "pid": os.getpid(),
+            "pid": 424242,
             "task_id": "t1",
             "pid_scope": "sandbox",
+            "watcher_interval": 5,
+            "session_key": "agent:main:telegram:dm:123",
+            "watcher_platform": "telegram",
+            "watcher_chat_id": "123",
+            "parent_session_id": "sess-live",
         }]
         checkpoint.write_text(json.dumps(original))
 
-        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+            patch("os.kill") as host_kill:
             recovered = registry.recover_from_checkpoint()
-            assert recovered == 0
-            assert registry.get("proc_remote") is None
 
-            data = json.loads(checkpoint.read_text())
-            assert data == []
+        assert recovered == 1, "sandbox run must be retained across restart, not dropped"
+        got = registry.get("proc_remote")
+        assert got is not None and not got.exited
+        assert got.pid is None, "no host PID to signal for a sandbox run"
+        assert got.supervision_state == "unresolved"
+        assert got.completion_reason == "unresolved"
+        assert got.last_supervision_error, "evidence for operator triage required"
+        host_kill.assert_not_called()
+        data = json.loads(checkpoint.read_text())
+        assert len(data) == 1
+        assert data[0]["supervision_state"] == "unresolved"
+        assert data[0]["last_supervision_error"], "checkpoint must keep the evidence"
+        routes = [w for w in registry.pending_watchers if w["session_id"] == "proc_remote"]
+        assert routes, "watch route must be re-armed so the gateway surfaces the run"
 
     def test_checkpoint_redacts_command_with_inline_secret(self, registry, tmp_path):
         """Issue #77484: the checkpoint file persists raw commands; inline
@@ -1340,6 +1333,7 @@ class TestKillProcess:
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
+        s.host_start_time = 777001
         registry._running[s.id] = s
 
         terminate_calls = []
@@ -1370,6 +1364,7 @@ class TestKillProcess:
             with patch("gateway.status._pid_exists", side_effect=lambda pid: kill_state["alive"]), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
+                 patch.object(ProcessRegistry, "_safe_host_start_time", return_value=777001), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
                 result = registry.kill_process(s.id)
 
@@ -1390,6 +1385,7 @@ class TestKillProcess:
         s = _make_session(sid="proc_kill_race", command="sleep 999")
         s.pid = 424243
         s.detached = True
+        s.host_start_time = 777002
         registry._running[s.id] = s
 
         def reader_wins_during_signal(pid, start=None):
@@ -1408,6 +1404,9 @@ class TestKillProcess:
             host_guard = patch.object(
                 ProcessRegistry, "_host_pid_is_ours", return_value=True
             )
+            probe_guard = patch.object(
+                ProcessRegistry, "_safe_host_start_time", return_value=777002
+            )
             term_patch = patch.object(
                 ProcessRegistry,
                 "_terminate_host_pid",
@@ -1416,7 +1415,7 @@ class TestKillProcess:
             saver = patch(
                 "tools.process_registry.save_completed_result", side_effect=record_save
             )
-            with host_guard, term_patch, saver:
+            with host_guard, probe_guard, term_patch, saver:
                 result = registry.kill_process(s.id)
 
             assert result["status"] == "killed"

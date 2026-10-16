@@ -67,6 +67,8 @@ _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", 
 # Process-watcher retries of a refused completion: ~5 min at the default 5 s check interval.
 _MAX_COMPLETION_INJECTION_ATTEMPTS = 8
 _COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
+_WATCHER_SEND_MAX_ATTEMPTS = 3
+_WATCHER_SEND_RETRY_DELAY_S = 2.0
 
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
@@ -1581,16 +1583,56 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         adapter = self._resolve_injection_adapter(platform_name, source)
         return session_key in (getattr(adapter, "_active_sessions", None) or {})
 
-    async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
+    async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> bool:
+        """Send a watcher notice with bounded retry. True = sent; False = failed after
+        retries (loudly logged) or unroutable — a failed send is never silently acked."""
         from gateway.run import _non_conversational_metadata
         source = await asyncio.to_thread(self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
-        if adapter and chat_id:
-            with _log_suppressed(logging.ERROR, "Watcher delivery error: %s"):
-                send_meta = {"thread_id": thread_id} if thread_id else None
-                await adapter.send(
+        if not adapter or not chat_id:
+            logger.warning(
+                "Watcher delivery unroutable (platform=%s chat=%s thread=%s); notice retained in logs",
+                platform_name, chat_id, thread_id)
+            return False
+        send_meta = {"thread_id": thread_id} if thread_id else None
+        last_error: Exception | str | None = None
+        for attempt in range(1, _WATCHER_SEND_MAX_ATTEMPTS + 1):
+            try:
+                result = await adapter.send(
                     chat_id, message_text, metadata=_non_conversational_metadata(send_meta, platform=platform_name),
                 )
+            except (OSError, RuntimeError, TimeoutError) as exc:
+                last_error = exc
+                logger.warning(
+                    "Watcher delivery error for %s chat=%s (attempt %d/%d): %s",
+                    platform_name, chat_id, attempt, _WATCHER_SEND_MAX_ATTEMPTS, exc, exc_info=True)
+                if attempt < _WATCHER_SEND_MAX_ATTEMPTS:
+                    await asyncio.sleep(_WATCHER_SEND_RETRY_DELAY_S * attempt)
+                continue
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Watcher delivery error for %s chat=%s (attempt %d/%d): %s",
+                    platform_name, chat_id, attempt, _WATCHER_SEND_MAX_ATTEMPTS, exc, exc_info=True)
+                if attempt < _WATCHER_SEND_MAX_ATTEMPTS:
+                    await asyncio.sleep(_WATCHER_SEND_RETRY_DELAY_S * attempt)
+                continue
+            # ``SendResult(success=False)`` is a real failure without an
+            # exception: retry durably until ack, never silently ack it.
+            if result is not None and not getattr(result, "success", True):
+                last_error = getattr(result, "error", None) or "send returned success=False"
+                logger.warning(
+                    "Watcher delivery refused for %s chat=%s (attempt %d/%d): %s",
+                    platform_name, chat_id, attempt, _WATCHER_SEND_MAX_ATTEMPTS, last_error)
+                if attempt < _WATCHER_SEND_MAX_ATTEMPTS:
+                    await asyncio.sleep(_WATCHER_SEND_RETRY_DELAY_S * attempt)
+                continue
+            return True
+        logger.error(
+            "Watcher delivery failed after %d attempts for %s chat=%s: %s. "
+            "The completion stays available via process(action='log'); no delivery was acknowledged.",
+            _WATCHER_SEND_MAX_ATTEMPTS, platform_name, chat_id, last_error)
+        return False
 
     @staticmethod
     def _build_process_completion_event(watcher: dict, session, session_id: str) -> dict:
@@ -1635,6 +1677,25 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             ),
         }
 
+    @staticmethod
+    def _format_supervision_unresolved_message(session_id: str, session) -> str:
+        """Honest escalation text: state unknown, nothing acknowledged as delivered."""
+        from gateway.run import _redact_gateway_user_facing_secrets
+        command = _redact_gateway_user_facing_secrets(getattr(session, "command", "") or "")
+        detail = getattr(session, "last_supervision_error", "") or "backend unreachable"
+        exit_code = getattr(session, "exit_code", None)
+        if exit_code is None:
+            outcome = ("The run may still be alive — its state is unknown and no exit was "
+                       "recorded. Output so far remains available via process(action='log'); "
+                       "the true completion will be delivered if supervision resumes.")
+        else:
+            outcome = (f"Exit {exit_code} was recorded but its delivery is not durable — "
+                       "operator triage required. Output so far remains available via "
+                       "process(action='log').")
+        return (
+            f"[Background process {session_id} ({command}) supervision LOST: {detail}. "
+            f"{outcome})")
+
     def _format_process_final_message(self, session_id: str, session, notify_mode: str) -> str:
         """Human-facing completion message. Every mode shares the one-line status header; the
         raw-output modes (all/result/error) append the bounded output tail under it instead of the
@@ -1673,6 +1734,160 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         )
         return future is not None
 
+    async def _watcher_maybe_surface_unresolved(self, session, session_id: str,
+                                                  platform_name: str, chat_id, thread_id,
+                                                  watcher: dict, silent: bool, surface: bool) -> None:
+        """Surface one durable ``unresolved`` escalation; ack only on send success."""
+        if not (
+            getattr(session, "supervision_state", "ok") == "unresolved"
+            and not getattr(session, "_unresolved_surfaced", False)
+            and not silent
+            and surface
+        ):
+            return
+        sent = await self._send_watcher_message(
+            platform_name, chat_id, thread_id,
+            self._format_supervision_unresolved_message(session_id, session), watcher,
+        )
+        if sent:
+            session._unresolved_surfaced = True
+
+    async def _watcher_deliver_agent_completion(self, watcher: dict, session,
+                                                session_id: str, synth_text: str,
+                                                completion_evt: dict, platform_name: str,
+                                                chat_id, thread_id, notify_mode: str,
+                                                interval: float, completion_attempts: int,
+                                                retry_interval: float) -> tuple[str, int, float]:
+        """Deliver one agent-notify completion; returns (action, attempts, retry)."""
+        _max_attempts = _MAX_COMPLETION_INJECTION_ATTEMPTS
+        _max_delay = _COMPLETION_INJECTION_RETRY_MAX_DELAY
+        turn_busy = await self._launching_turn_active(platform_name, watcher)
+        delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
+        if delivered is not False:
+            try:
+                from tools.process_registry_delivery import ack_delivery
+                ack_delivery(session_id)
+            except (OSError, ValueError) as exc:
+                logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+            except Exception as exc:
+                logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+            if turn_busy and (notify_mode in {"concise", "all", "result"} or (
+                notify_mode == "error" and session.exit_code not in {0, None}
+            )):
+                message_text = self._format_process_final_message(session_id, session, "concise")
+                receipt_ok = await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
+                if not receipt_ok:
+                    logger.warning(
+                        "Process watcher: concise receipt for %s failed; "
+                        "the admitted turn still carries the result", session_id)
+            return ("break", completion_attempts, retry_interval)
+        completion_attempts += 1
+        if completion_attempts < _max_attempts:
+            retry_interval = jittered_backoff(
+                completion_attempts, base_delay=max(interval, 1) * 2,
+                max_delay=_max_delay, jitter_ratio=0.0)
+            return ("continue", completion_attempts, retry_interval)
+        if (getattr(self, 'session_authority', None) is not None
+                and self._completion_delivery_identity(completion_evt) is not None):
+            from gateway.session_automation import completion_admission
+            try:
+                async with self._completion_event_scope(completion_evt):
+                    committed = completion_admission(self, completion_evt) is not None
+            except (OSError, ValueError, RuntimeError) as exc:
+                logger.debug("Process watcher: admission recheck failed for %s: %s", session_id, exc, exc_info=True)
+                committed = False
+            except Exception as exc:
+                logger.debug("Process watcher: admission recheck failed for %s: %s", session_id, exc, exc_info=True)
+                committed = False
+            if committed:
+                return ("break", completion_attempts, retry_interval)
+        logger.warning(
+            "Process watcher: completion for %s was refused %d times; falling back to the "
+            "notify_mode=%s notice", session_id, completion_attempts, notify_mode,
+        )
+        return ("fallthrough", completion_attempts, retry_interval)
+
+    async def _watcher_deliver_text_notice(self, watcher: dict, session, session_id: str,
+                                           platform_name: str, chat_id, thread_id,
+                                           notify_mode: str) -> str:
+        """Deliver the final text notice; returns break/continue/fallthrough."""
+        from tools.process_registry import process_registry
+        if process_registry.is_completion_consumed(session_id):
+            logger.debug(
+                "Process watcher: completion for %s already consumed "
+                "via wait/log — skipping raw notification (#65379)", session_id,
+            )
+            try:
+                from tools.process_registry_delivery import ack_delivery
+                ack_delivery(session_id)
+            except (OSError, ValueError) as exc:
+                logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+            except Exception as exc:
+                logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+            return "break"
+        if notify_mode in {"concise", "all", "result"} or (
+            notify_mode == "error" and session.exit_code not in {0, None}
+        ):
+            message_text = self._format_process_final_message(session_id, session, notify_mode)
+            from gateway.warning_notifications import present_notification
+            send_ok = False
+
+            async def _present_final() -> None:
+                nonlocal send_ok
+                send_ok = await self._send_watcher_message(
+                    platform_name, chat_id, thread_id, message_text, watcher)
+
+            async with self._completion_event_scope(watcher):
+                presented = await present_notification(
+                    _present_final,
+                    platform=platform_name, diagnostic=session.exit_code not in {0, None})
+            if not presented:
+                try:
+                    from tools.process_registry_delivery import ack_delivery
+                    ack_delivery(session_id)
+                except (OSError, ValueError) as exc:
+                    logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+                except Exception as exc:
+                    logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+                return "break"
+            if send_ok:
+                try:
+                    from tools.process_registry_delivery import ack_delivery
+                    ack_delivery(session_id)
+                except (OSError, ValueError) as exc:
+                    logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+                except Exception as exc:
+                    logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+                return "break"
+            logger.warning(
+                "Process watcher: final notice for %s failed after retries; "
+                "will retry next tick", session_id)
+            return "continue"
+        try:
+            from tools.process_registry_delivery import ack_delivery
+            ack_delivery(session_id)
+        except (OSError, ValueError) as exc:
+            logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+        except Exception as exc:
+            logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+        return "break"
+
+    @staticmethod
+    def _settle_suppressed_delivery(session_id: str) -> None:
+        """Ack a terminally suppressed completion without sending a message.
+
+        Off-mode and ownership-suppressed exits carry no user notice, but the
+        durable outbox must still settle: otherwise recovery re-arms a watcher
+        for a notice policy will suppress again (replay leak). Terminal only —
+        callers gate on ``session.exited`` so live jobs never settle here."""
+        try:
+            from tools.process_registry_delivery import ack_delivery
+            ack_delivery(session_id)
+        except (OSError, ValueError) as exc:
+            logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+        except Exception as exc:
+            logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+
     async def _run_process_watcher(self, watcher: dict) -> None:
         """Poll a background process and push updates until it exits. Mode
         (``display.background_process_notifications``): concise (default one-liner; failures append
@@ -1706,86 +1921,58 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     "owner_task_id": getattr(session, "owner_task_id", ""),
                     "task_id": getattr(session, "task_id", ""),
                 })
+            await self._watcher_maybe_surface_unresolved(
+                session, session_id, platform_name, chat_id, thread_id, watcher, silent, surface)
+            if watcher.get("unresolved_escalation_replay"):
+                # Durable unresolved-finish replay: one explicit owner escalation,
+                # never the normal completion (which would duplicate it) and never
+                # a relaunched job (the session is finished). Policy-suppressed
+                # escalations settle without sending, like any terminal suppression.
+                if getattr(session, "_unresolved_surfaced", False):
+                    break
+                if getattr(session, "supervision_state", "ok") != "unresolved":
+                    break
+                if silent or not surface:
+                    session._unresolved_surfaced = True
+                    self._settle_suppressed_delivery(session_id)
+                    break
+                continue
             if not surface:
                 # Recheck live ownership next tick: handoff retains notification intent.
                 if session.exited:
+                    self._settle_suppressed_delivery(session_id)
                     break
                 continue
             if silent:
                 # Still wait for the process to exit so we can log it, but don't push any messages.
                 if session.exited:
+                    self._settle_suppressed_delivery(session_id)
                     break
                 continue
             current_output_len = len(session.output_buffer)
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
             if session.exited:
-                # Agent-notify: inject a synthetic message unless the agent already consumed the result via
-                # wait/log (poll() is read-only and deliberately does NOT mark consumed).
                 if agent_notify and not process_registry.is_completion_consumed(session_id):
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
+                        self._settle_suppressed_delivery(session_id)
                         break
-                    # Captured before injection: afterwards the key is busy either way (the injected
-                    # turn itself installs the guard).
-                    turn_busy = await self._launching_turn_active(platform_name, watcher)
-                    delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
-                    if delivered is not False:
-                        # The agent normally reports the result itself, so the chat gets no separate
-                        # receipt. While the launching turn is still running the injection only queues a
-                        # follow-up, and the chat would stay mute for as long as that turn lasts
-                        # (#112033): send the concise receipt now.
-                        if turn_busy and (notify_mode in {"concise", "all", "result"} or (
-                            notify_mode == "error" and session.exit_code not in {0, None}
-                        )):
-                            message_text = self._format_process_final_message(session_id, session, "concise")
-                            await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
+                    action, completion_attempts, retry_interval = await self._watcher_deliver_agent_completion(
+                        watcher, session, session_id, synth_text, completion_evt,
+                        platform_name, chat_id, thread_id, notify_mode,
+                        interval, completion_attempts, retry_interval)
+                    if action == "break":
                         break
-                    # A refusal may clear (adapter reconnecting, store draining), so retry with backoff
-                    # for a few minutes, then fall through to the plain notice instead of dropping it.
-                    completion_attempts += 1
-                    if completion_attempts < _MAX_COMPLETION_INJECTION_ATTEMPTS:
-                        retry_interval = jittered_backoff(
-                            completion_attempts, base_delay=max(interval, 1) * 2,
-                            max_delay=_COMPLETION_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
+                    if action == "continue":
                         continue
-                    if (getattr(self, 'session_authority', None) is not None
-                            and self._completion_delivery_identity(completion_evt) is not None):
-                        from gateway.session_automation import completion_admission
-                        try:
-                            # The owning profile's authority, as on the delivery path.
-                            async with self._completion_event_scope(completion_evt):
-                                committed = completion_admission(self, completion_evt) is not None
-                        except Exception:
-                            # Failing open sends the notice; a dead watcher would send nothing.
-                            logger.debug("Process watcher: admission recheck failed for %s", session_id,
-                                         exc_info=True)
-                            committed = False
-                        if committed:
-                            break  # The last refusal was a lost ACK: the turn is committed.
-                    logger.warning(
-                        "Process watcher: completion for %s was refused %d times; falling back to the "
-                        "notify_mode=%s notice", session_id, completion_attempts, notify_mode,
-                    )
-                # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
-                # FALLS THROUGH here, hence the re-check).
-                if process_registry.is_completion_consumed(session_id):
-                    logger.debug(
-                        "Process watcher: completion for %s already consumed "
-                        "via wait/log — skipping raw notification (#65379)", session_id,
-                    )
+                outcome = await self._watcher_deliver_text_notice(
+                    watcher, session, session_id, platform_name, chat_id, thread_id, notify_mode)
+                if outcome == "break":
                     break
-                if notify_mode in {"concise", "all", "result"} or (
-                    notify_mode == "error" and session.exit_code not in {0, None}
-                ):
-                    message_text = self._format_process_final_message(session_id, session, notify_mode)
-                    from gateway.warning_notifications import present_notification
-                    async with self._completion_event_scope(watcher):
-                        # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
-                        await present_notification(
-                            lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher),
-                            platform=platform_name, diagnostic=session.exit_code not in {0, None})
+                if outcome == "continue":
+                    continue
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output — deliver a status update (only in "all" mode; agent_notify watchers

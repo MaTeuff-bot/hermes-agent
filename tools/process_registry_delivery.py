@@ -1,0 +1,286 @@
+"""Durable pending terminal-delivery outbox for background completions.
+
+``process-results/`` receipts are read-only snapshots, never replayed as
+notifications. This outbox is the complementary durable record: one small file
+per finished session that still owns a watcher route. It is written BEFORE the
+query-only result save by the registry finisher, replayed after a restart via
+``recover_from_checkpoint`` into ``pending_watchers``, and deleted only after
+gateway admission + send success (``ack_delivery``). A failed send never acks.
+
+Retention SLA: 7 days of delivery attempts. Expired undelivered records are
+NEVER silently deleted: they are retained with ``expired: true`` and escalated
+once (loud warning, rate-limited per session), staying queryable for operator
+triage. Host loss / route unavailability yields ``unknown``, never a fake exit.
+No cron: expiry is evaluated lazily on list/recover.
+"""
+import json
+import logging
+import time
+
+logger = logging.getLogger("tools.process_registry")
+
+DELIVERY_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+
+def _delivery_dir():
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "logs" / "process-delivery"
+
+
+def write_pending_delivery(session) -> bool:
+    """Persist one pending terminal delivery. True when written/kept."""
+    if not (getattr(session, "watcher_interval", 0) > 0 or getattr(session, "notify_on_complete", False)):
+        return False
+    try:
+        from hermes_constants import assert_named_profile_home_live
+        from utils import atomic_json_write
+        from agent.redact import redact_sensitive_text, redact_terminal_output
+        directory = _delivery_dir()
+        assert_named_profile_home_live(directory)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            raw_output = getattr(session, "output_buffer", "") or ""
+            output_tail = raw_output[-4000:]
+            output_tail = redact_terminal_output(
+                output_tail, getattr(session, "command", ""), force=True)
+        except (ValueError, RuntimeError, OSError) as exc:
+            logger.debug("Delivery output redact failed for %s: %s", getattr(session, "id", "?"), exc, exc_info=True)
+            output_tail = ""
+        except Exception as exc:
+            logger.debug("Delivery output redact failed for %s: %s", getattr(session, "id", "?"), exc, exc_info=True)
+            output_tail = ""
+        record = {
+            "session_id": session.id,
+            "session_key": getattr(session, "session_key", ""),
+            "task_id": getattr(session, "task_id", ""),
+            "owner_task_id": getattr(session, "owner_task_id", ""),
+            "parent_session_id": getattr(session, "parent_session_id", ""),
+            "command": redact_sensitive_text(getattr(session, "command", ""), code_file=True),
+            "output": output_tail,
+            "exit_code": getattr(session, "exit_code", None),
+            "completion_reason": getattr(session, "completion_reason", ""),
+            "termination_source": getattr(session, "termination_source", ""),
+            "started_at": getattr(session, "started_at", time.time()),
+            "watcher_interval": getattr(session, "watcher_interval", 0),
+            "notify_on_complete": bool(getattr(session, "notify_on_complete", False)),
+            "created_at": time.time(),
+        }
+        for key in ("platform", "chat_id", "user_id", "user_name", "thread_id", "message_id"):
+            try:
+                record[f"watcher_{key}"] = getattr(session, f"watcher_{key}", "") or ""
+            except (AttributeError, ValueError) as exc:
+                logger.debug("Delivery route copy failed for %s key %s: %s",
+                             getattr(session, "id", "?"), key, exc, exc_info=True)
+                record[f"watcher_{key}"] = ""
+            except Exception as exc:
+                logger.debug("Delivery route copy failed for %s key %s: %s",
+                             getattr(session, "id", "?"), key, exc, exc_info=True)
+                record[f"watcher_{key}"] = ""
+        atomic_json_write(directory / f"{session.id}.json", record, mode=0o600)
+        return True
+    except OSError:
+        logger.warning("Could not persist pending delivery for %s", getattr(session, "id", "?"), exc_info=True)
+        return False
+
+
+def has_pending_delivery(session_id: str) -> bool:
+    """True when an unacknowledged outbox record exists for the session.
+
+    The finished-cache prune consults this so an undelivered completion is never
+    evicted from the live retry path: the watcher resolves sessions via ``get``,
+    and a pruned session breaks the watcher without redelivery until restart.
+    Uncertain (unresolvable home) keeps the session — never silently drop work."""
+    try:
+        return (_delivery_dir() / f"{session_id}.json").exists()
+    except Exception:
+        logger.debug("Pending-delivery probe failed for %s", session_id, exc_info=True)
+        return True
+
+
+def ack_delivery(session_id: str) -> None:
+    """Delete the pending record after admission + send success. Failed sends never call this."""
+    try:
+        path = _delivery_dir() / f"{session_id}.json"
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("Could not ack pending delivery %s", session_id, exc_info=True)
+
+
+_EXPIRED_ESCALATED: set[str] = set()
+_EXPIRED_LOG_AT: dict[str, float] = {}
+_EXPIRED_LOG_INTERVAL_S = 3600.0
+
+
+def _escalate_expired_once(session_id: str, path_name: str) -> None:
+    """Loud, rate-limited escalation for an expired undelivered outbox record."""
+    now = time.time()
+    last = _EXPIRED_LOG_AT.get(session_id, 0.0)
+    if session_id in _EXPIRED_ESCALATED and (now - last) < _EXPIRED_LOG_INTERVAL_S:
+        return
+    _EXPIRED_ESCALATED.add(session_id)
+    _EXPIRED_LOG_AT[session_id] = now
+    logger.warning(
+        "Pending delivery %s expired after %d days undelivered; retained as expired, "
+        "not deleted (file %s). Route unavailable or host lost; operator triage required.",
+        session_id, DELIVERY_RETENTION_SECONDS // 86400, path_name)
+
+
+def list_pending_deliveries(*, include_expired: bool = True) -> list:
+    """Pending records, oldest first. Expired undelivered are retained + escalated.
+
+    Never silently deletes: an expired record is kept with ``expired: true`` and
+    logged loudly once per hour per session (bounded). Callers that only want
+    deliverable work pass ``include_expired=False``.
+    """
+    try:
+        directory = _delivery_dir()
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.debug("Delivery dir resolve failed: %s", exc, exc_info=True)
+        return []
+    except Exception as exc:
+        logger.debug("Delivery dir resolve failed: %s", exc, exc_info=True)
+        return []
+    if not directory.exists():
+        return []
+    cutoff = time.time() - DELIVERY_RETENTION_SECONDS
+    staged = []
+    for path in directory.glob("proc_*.json"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError as exc:
+            logger.debug("Delivery stat failed for %s: %s", path.name, exc, exc_info=True)
+            continue
+        except Exception as exc:
+            logger.debug("Delivery stat failed for %s: %s", path.name, exc, exc_info=True)
+            continue
+        staged.append((mtime, path))
+    records = []
+    for _, path in sorted(staged):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as exc:
+            logger.debug("Delivery read failed for %s: %s", path.name, exc, exc_info=True)
+            continue
+        except Exception as exc:
+            logger.debug("Delivery read failed for %s: %s", path.name, exc, exc_info=True)
+            continue
+        try:
+            expired = path.stat().st_mtime < cutoff
+        except (OSError, ValueError):
+            expired = False
+        if expired:
+            record["expired"] = True
+            _escalate_expired_once(str(record.get("session_id", path.stem)), path.name)
+            if not include_expired:
+                continue
+        records.append(record)
+    return records
+
+
+def outbox_failure_bound() -> int:
+    """Retry bound for durable writes; reuses the supervision bounded policy."""
+    try:
+        from tools.process_registry_supervision import ENV_SUPERVISION_MAX_FAILURES
+        return int(ENV_SUPERVISION_MAX_FAILURES)
+    except (ImportError, AttributeError, ValueError, TypeError):
+        return 5
+
+
+def write_pending_delivery_with_retry(session) -> tuple[bool, int]:
+    """Bounded synchronous outbox retry for the finisher.
+
+    One finisher call retries a transient disk failure in place, so the local
+    reader (single ``_finish_exited``) and the sandbox poller need no second
+    pass: fail once then recover still yields one event and one receipt.
+    No sleep, no threads, no watcher CPU: at most ``outbox_failure_bound``
+    immediate attempts. Returns ``(ok, attempts)``.
+    """
+    bound = outbox_failure_bound()
+    attempts = 0
+    while attempts < bound:
+        attempts += 1
+        try:
+            ok = bool(write_pending_delivery(session))
+        except Exception:
+            logger.warning(
+                "Pending-delivery outbox write failed for %s (attempt %d/%d)",
+                getattr(session, "id", "?"), attempts, bound, exc_info=True)
+            ok = False
+        if ok:
+            return True, attempts
+        if attempts < bound:
+            logger.warning(
+                "Pending-delivery outbox not durable for %s (attempt %d/%d); retrying",
+                getattr(session, "id", "?"), attempts, bound)
+    return False, attempts
+
+
+def build_unresolved_finish_record(session) -> dict:
+    """Checkpoint-fallback evidence for a finish whose outbox write failed.
+
+    The outbox (``logs/process-delivery/``) is the primary replay path; when it
+    is unavailable but the checkpoint file still is, this record rides the
+    checkpoint instead so a cold restart still re-arms an explicit owner
+    escalation. It is terminal evidence only (exit already recorded) — recovery
+    rebuilds a FINISHED session and never re-runs work. Preserved until the
+    escalation is terminally delivered (``_unresolved_surfaced``); when every
+    persistence channel is gone nothing durable can be promised and the caller
+    keeps the in-memory escalation only."""
+    try:
+        from agent.redact import redact_sensitive_text, redact_terminal_output
+        raw_output = getattr(session, "output_buffer", "") or ""
+        output_tail = redact_terminal_output(
+            raw_output[-4000:], getattr(session, "command", ""), force=True)
+        command = redact_sensitive_text(getattr(session, "command", ""), code_file=True)
+    except (ValueError, RuntimeError, OSError, AttributeError) as exc:
+        logger.debug("Unresolved-finish redact failed for %s: %s",
+                     getattr(session, "id", "?"), exc, exc_info=True)
+        output_tail = ""
+        command = getattr(session, "command", "") or ""
+    record = {
+        "session_id": getattr(session, "id", ""),
+        "unresolved_finish": True,
+        "command": command,
+        "output": output_tail,
+        "exit_code": getattr(session, "exit_code", None),
+        "completion_reason": getattr(session, "completion_reason", ""),
+        "termination_source": getattr(session, "termination_source", ""),
+        "supervision_state": "unresolved",
+        "supervision_failures": getattr(session, "supervision_failures", 0),
+        "last_supervision_error": getattr(session, "last_supervision_error", ""),
+        "outbox_failures": getattr(session, "_outbox_failures", 0),
+        "session_key": getattr(session, "session_key", ""),
+        "task_id": getattr(session, "task_id", ""),
+        "owner_task_id": getattr(session, "owner_task_id", ""),
+        "parent_session_id": getattr(session, "parent_session_id", ""),
+        "started_at": getattr(session, "started_at", time.time()),
+        "watcher_interval": getattr(session, "watcher_interval", 0),
+        "notify_on_complete": bool(getattr(session, "notify_on_complete", False)),
+        "created_at": time.time(),
+    }
+    for key in ("platform", "chat_id", "user_id", "user_name", "thread_id", "message_id"):
+        try:
+            record[f"watcher_{key}"] = getattr(session, f"watcher_{key}", "") or ""
+        except (AttributeError, ValueError) as exc:
+            logger.debug("Delivery route copy failed for %s key %s: %s",
+                         getattr(session, "id", "?"), key, exc, exc_info=True)
+            record[f"watcher_{key}"] = ""
+    return record
+
+
+def escalate_outbox_unresolved(session, attempts: int) -> None:
+    """Durable escalation after exhausted synchronous retry.
+
+    The real exit is preserved (never overwritten); the session carries an
+    explicit ``unresolved`` marker with evidence instead of stopping silently.
+    The caller still finishes honestly: query-only result best-effort,
+    in-memory completion queued, checkpoint best-effort.
+    """
+    session._outbox_failures = int(attempts or 0)
+    session.supervision_state = "unresolved"
+    session.last_supervision_error = (
+        f"Pending delivery outbox unavailable after {attempts} attempts; "
+        "exit recorded, notification not durable, operator triage required")[:300]
+    logger.warning(
+        "Pending delivery %s unresolved after %d attempts; exit recorded, not durable",
+        getattr(session, "id", "?"), attempts)
