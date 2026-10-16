@@ -79,17 +79,53 @@ class ProcessCheckpointMixin:
         from tools.process_registry_output_log import adoptable_log
 
         checkpoint_path = _checkpoint_path()
-        if not checkpoint_path.exists():
-            return 0
         try:
-            entries = json.loads(checkpoint_path.read_text(encoding="utf-8-sig"))
+            entries = json.loads(checkpoint_path.read_text(encoding="utf-8-sig")) if checkpoint_path.exists() else []
         except Exception:
-            return 0
+            entries = []
         recovered = 0
+        try:
+            from tools.process_registry_delivery import list_pending_deliveries
+            for record in list_pending_deliveries():
+                session_id = record.get("session_id", "")
+                if not session_id:
+                    continue
+                with self._lock:
+                    if session_id in self._running or session_id in self._finished:
+                        continue
+                    known = {w.get("session_id") for w in self.pending_watchers}
+                if session_id in known:
+                    continue
+                # Rebuild the finished terminal session so the re-armed watcher
+                # resolves it (``get`` would otherwise return None and the
+                # watcher would break without delivering). ``process-results/``
+                # stays query-only; this outbox carries its own output tail.
+                try:
+                    self._rebuild_pending_delivery_session(record)
+                    recovered += 1
+                except Exception:
+                    logger.debug("Skipping unreadable pending delivery %s", session_id, exc_info=True)
+                    continue
+                self.pending_watchers.append({
+                    "session_id": session_id,
+                    "check_interval": record.get("watcher_interval", 5) or 5,
+                    "session_key": record.get("session_key", ""),
+                    "platform": record.get("watcher_platform", ""),
+                    "chat_id": record.get("watcher_chat_id", ""),
+                    "user_id": record.get("watcher_user_id", ""),
+                    "user_name": record.get("watcher_user_name", ""),
+                    "thread_id": record.get("watcher_thread_id", ""),
+                    "message_id": record.get("watcher_message_id", ""),
+                    "notify_on_complete": record.get("notify_on_complete", False),
+                    "parent_session_id": record.get("parent_session_id", ""),
+                    "pending_delivery_replay": True,
+                })
+        except Exception:
+            pass
         unresolved_scope_entries: list[dict[str, Any]] = []
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
-            if not pid:
+            if not pid and pid_scope == "host":
                 continue
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
@@ -97,10 +133,23 @@ class ProcessCheckpointMixin:
                 already_tracked = entry.get("session_id") in self._running
             if already_tracked:
                 continue
-            if pid_scope != "host":  # in-sandbox PIDs mean nothing once the env handle is gone
-                logger.info(
-                    "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
-                    entry.get("command", "unknown")[:60], pid, pid_scope)
+            if pid_scope != "host":
+                # In-sandbox PIDs mean nothing once the env handle is gone, but the run
+                # is not over: retain the entry as durable ``unresolved`` evidence (never
+                # a faked exit, never dropped) so ``reattach_env_session`` can resume the
+                # same container when its backend returns, and the gateway surfaces it.
+                entry = {**entry, "supervision_state": "unresolved",
+                         "completion_reason": entry.get("completion_reason") or "unresolved",
+                         "termination_source": entry.get("termination_source") or "backend_unreachable",
+                         "last_supervision_error": entry.get("last_supervision_error") or (
+                             "registry restarted while the sandbox run was unsupervised")}
+                unresolved_scope_entries.append(entry)
+                self._retain_unresolved_sandbox_session(entry)
+                logger.warning(
+                    "Retaining unsupervised sandbox process: %s (session=%s, container=%s)",
+                    entry.get("command", "unknown")[:60], entry.get("session_id", "?"),
+                    entry.get("sandbox_container_id", "?"))
+                recovered += 1
                 continue
             # Alive and still ours: re-attach. A start-time probe that cannot
             # be read is not proof the PID was reused — dropping it would leave
@@ -157,3 +206,80 @@ class ProcessCheckpointMixin:
                 })
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered
+
+    def _rebuild_pending_delivery_session(self, record: dict[str, Any]) -> None:
+        """Rebuild a finished terminal session from a pending-delivery record.
+
+        The watcher drain resolves sessions via ``get``; without a rebuilt
+        entry it would see ``None`` and break without delivering. The record
+        carries its own redacted output tail, so this never reads the
+        query-only ``process-results/`` snapshots as notifications.
+        """
+        from tools.process_registry import ProcessSession
+        session_id = record.get("session_id", "")
+        if not session_id:
+            raise ValueError("missing session_id")
+        with self._lock:
+            if session_id in self._running or session_id in self._finished:
+                return
+            session = ProcessSession(
+                id=session_id,
+                command=record.get("command", "unknown"),
+                task_id=record.get("task_id", ""),
+                owner_task_id=record.get("owner_task_id", "") or record.get("task_id", ""),
+                session_key=record.get("session_key", ""),
+                parent_session_id=record.get("parent_session_id", ""),
+                started_at=record.get("started_at", time.time()),
+                exit_code=record.get("exit_code"),
+                completion_reason=record.get("completion_reason", "exited"),
+                termination_source=record.get("termination_source", ""),
+                output_buffer=record.get("output", "") or "",
+                exited=True,
+                watcher_platform=record.get("watcher_platform", ""),
+                watcher_chat_id=record.get("watcher_chat_id", ""),
+                watcher_user_id=record.get("watcher_user_id", ""),
+                watcher_user_name=record.get("watcher_user_name", ""),
+                watcher_thread_id=record.get("watcher_thread_id", ""),
+                watcher_message_id=record.get("watcher_message_id", ""),
+                watcher_interval=int(record.get("watcher_interval", 0) or 0),
+                notify_on_complete=bool(record.get("notify_on_complete", False)),
+                pid=None, pid_scope="host", detached=True,
+            )
+            session._completion_event.set()
+            self._finished[session.id] = session
+
+    def _retain_unresolved_sandbox_session(self, entry: dict[str, Any]) -> None:
+        """Rebuild an in-memory marker for a checkpointed sandbox run whose backend is
+        gone. No PID and no runtime handle: poll()/watchers report it as running with
+        ``supervision_state=unresolved``, kill refuses to signal it, and only
+        ``reattach_env_session`` (identity-verified) resumes supervision."""
+        from tools.process_registry import (
+            ProcessSession, _CHECKPOINT_FIELDS, _CHECKPOINT_DEFAULTS,
+            _WATCHER_ROUTE_KEYS,
+        )
+        session_id = entry.get("session_id", "")
+        if not session_id:
+            return
+        with self._lock:
+            if session_id in self._running or session_id in self._finished:
+                return
+            fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
+            fields.update(
+                command=entry.get("command", "unknown"),
+                owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
+                started_at=entry.get("started_at", time.time()),
+                completion_reason="unresolved", termination_source="backend_unreachable",
+                supervision_state="unresolved",
+                last_supervision_error=entry.get("last_supervision_error", ""),
+                pid=None, env_ref=None, detached=True)
+            session = ProcessSession(id=session_id, **fields)
+            self._running[session.id] = session
+            if session.watcher_interval > 0:
+                self.pending_watchers.append({
+                    "session_id": session.id,
+                    "check_interval": session.watcher_interval,
+                    "session_key": session.session_key,
+                    **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+                    "notify_on_complete": session.notify_on_complete,
+                    "parent_session_id": session.parent_session_id,
+                })

@@ -938,16 +938,31 @@ class TestSpawnEnvSanitization:
         assert session.id not in registry._running
 
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
+        """Sandbox probes quote wrapper paths and trust only identity-verified receipts.
+
+        Realistic pinned probes: log delta, run-token read, framed exit receipt,
+        final log drain. The exit ``tok123\\n0`` is trusted because the live
+        token and container match the spawn record; a mismatched token would
+        escalate to ``unresolved`` instead of finishing.
+        """
         session = _make_session(sid="proc_space")
         session.exited = False
+        session.sandbox_container_id = "ctr-test"
+        session.sandbox_backend = "FakeEnv"
+        session.sandbox_pid = 4242
+        session.sandbox_run_token = "tok123"
+        session.env_token_path = "/path with spaces/hermes_bg.token"
 
         class FakeEnv:
+            _container_id = "ctr-test"
+
             def __init__(self):
                 self.commands = []
                 self._responses = iter([
-                    {"output": "6 0\nhello\n"},
-                    {"output": "1\n"},
-                    {"output": "0\n"},
+                    {"output": "6 0\nhello\n", "returncode": 0},
+                    {"output": "tok123\n", "returncode": 0},
+                    {"output": "tok123\n0\n", "returncode": 0},
+                    {"output": "6 6\n", "returncode": 0},
                 ])
 
             def execute(self, command, **kwargs):
@@ -956,8 +971,7 @@ class TestSpawnEnvSanitization:
 
         env = FakeEnv()
 
-        with patch("tools.process_registry.time.sleep", return_value=None), \
-            patch.object(registry, "_move_to_finished"):
+        with patch.object(registry, "_write_checkpoint"):
             registry._env_poller_loop(
                 session,
                 env,
@@ -966,10 +980,53 @@ class TestSpawnEnvSanitization:
                 "/path with spaces/hermes_bg.exit",
             )
 
-        assert "'/path with spaces/hermes_bg.log'" in env.commands[0][0]
-        assert "cat '/path with spaces/hermes_bg.log'" not in env.commands[0][0]
-        assert "'/path with spaces/hermes_bg.pid'" in env.commands[1][0]
-        assert "'/path with spaces/hermes_bg.exit'" in env.commands[2][0]
+        assert session.exited is True
+        assert session.exit_code == 0
+        assert getattr(session, "supervision_state", "ok") != "unresolved"
+        flat = " \n".join(c[0] for c in env.commands)
+        assert "'/path with spaces/hermes_bg.log'" in flat
+        assert "cat '/path with spaces/hermes_bg.log'" not in flat
+        assert "'/path with spaces/hermes_bg.token'" in flat
+        assert "'/path with spaces/hermes_bg.exit'" in flat
+        # Liveness/pid probes embed the quoted pid path when they run; the
+        # exit path above finishes first, so the pid path is asserted via a
+        # single running-cycle probe below (no host signal, no invented exit).
+        running = _make_session(sid="proc_space_running")
+        running.exited = False
+        running.sandbox_container_id = "ctr-test"
+        running.sandbox_run_token = "tok123"
+        running.sandbox_pid = 4242
+        running.env_token_path = "/path with spaces/hermes_bg.token"
+
+        class RunningEnv:
+            _container_id = "ctr-test"
+
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, **kwargs):
+                self.commands.append(command)
+                if command.startswith("O="):
+                    return {"output": "6 0\nhello\n", "returncode": 0}
+                if "hermes_bg.token" in command:
+                    return {"output": "tok123\n", "returncode": 0}
+                if "hermes_bg.exit" in command:
+                    return {"output": "__NO_RECEIPT__\n", "returncode": 0}
+                if "kill -0" in command:
+                    return {"output": "0\n", "returncode": 0}
+                raise AssertionError(f"unexpected probe: {command[:80]!r}")
+
+        renv = RunningEnv()
+        from tools.process_registry_supervision import _poll_cycle
+        import shlex as _shlex
+        _poll_cycle(
+            registry, running, renv, _shlex.quote,
+            "/path with spaces/hermes_bg.log",
+            "/path with spaces/hermes_bg.pid",
+            "/path with spaces/hermes_bg.exit", 0)
+        assert not running.exited
+        assert any("'/path with spaces/hermes_bg.pid'" in c for c in renv.commands), \
+            f"pid path not quoted in probes: {renv.commands!r}"
 
 
 class TestEnvPollerIncrementalRead:
@@ -1286,6 +1343,13 @@ class TestCheckpoint:
 
 
     def test_recovery_skips_explicit_sandbox_backed_entries(self, registry, tmp_path):
+        """Sandbox runs are retained as durable ``unresolved``, never host-signalled.
+
+        The in-sandbox PID means nothing once the env handle is gone: recovery
+        keeps the entry with ``pid=None`` (no host kill), marks it
+        ``unresolved`` with evidence, and re-arms its watcher route with
+        gateway keys (``platform``, not ``watcher_platform``).
+        """
         checkpoint = tmp_path / "procs.json"
         original = [{
             "session_id": "proc_remote",
@@ -1293,16 +1357,50 @@ class TestCheckpoint:
             "pid": os.getpid(),
             "task_id": "t1",
             "pid_scope": "sandbox",
+            "sandbox_container_id": "ctr-original",
+            "sandbox_run_token": "tok-original",
+            "env_log_path": "/tmp/hermes_bg_proc_remote.log",
+            "env_pid_path": "/tmp/hermes_bg_proc_remote.pid",
+            "env_exit_path": "/tmp/hermes_bg_proc_remote.exit",
+            "env_token_path": "/tmp/hermes_bg_proc_remote.token",
+            "session_key": "agent:main:telegram:dm:123",
+            "watcher_platform": "telegram",
+            "watcher_chat_id": "123",
+            "watcher_interval": 5,
+            "notify_on_complete": True,
+            "parent_session_id": "sess-spawner",
         }]
         checkpoint.write_text(json.dumps(original))
 
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
-            assert recovered == 0
-            assert registry.get("proc_remote") is None
+            assert recovered == 1, "sandbox run must be retained, not dropped"
+            session = registry.get("proc_remote")
+            assert session is not None
+            assert session.exited is False
+            assert getattr(session, "supervision_state", "") == "unresolved"
+            assert session.completion_reason == "unresolved"
+            assert session.pid is None, "no host PID to signal for a sandbox run"
+            assert session.last_supervision_error, "evidence required"
 
             data = json.loads(checkpoint.read_text())
-            assert data == []
+            assert len(data) == 1
+            assert data[0]["session_id"] == "proc_remote"
+            assert data[0].get("supervision_state") == "unresolved"
+
+            assert len(registry.pending_watchers) == 1
+            watcher = registry.pending_watchers[0]
+            assert watcher["session_id"] == "proc_remote"
+            assert watcher.get("platform") == "telegram"
+            assert watcher.get("chat_id") == "123"
+            assert "watcher_platform" not in watcher
+            assert watcher.get("parent_session_id") == "sess-spawner"
+
+            # Kill must refuse to signal: the recorded PID may belong to an
+            # unrelated host process after the restart.
+            result = registry.kill_process("proc_remote")
+            assert result["status"] == "error"
+            assert "Refusing to signal" in result["error"] or "cannot be killed" in result["error"].lower()
 
     def test_checkpoint_redacts_command_with_inline_secret(self, registry, tmp_path):
         """Issue #77484: the checkpoint file persists raw commands; inline
