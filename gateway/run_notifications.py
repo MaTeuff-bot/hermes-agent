@@ -1606,6 +1606,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 logger.warning(
                     "Watcher delivery error for %s chat=%s (attempt %d/%d): %s",
                     platform_name, chat_id, attempt, _WATCHER_SEND_MAX_ATTEMPTS, exc, exc_info=True)
+                if attempt < _WATCHER_SEND_MAX_ATTEMPTS:
+                    await asyncio.sleep(_WATCHER_SEND_RETRY_DELAY_S * attempt)
+                continue
             except Exception as exc:
                 last_error = exc
                 logger.warning(
@@ -1680,11 +1683,18 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         from gateway.run import _redact_gateway_user_facing_secrets
         command = _redact_gateway_user_facing_secrets(getattr(session, "command", "") or "")
         detail = getattr(session, "last_supervision_error", "") or "backend unreachable"
+        exit_code = getattr(session, "exit_code", None)
+        if exit_code is None:
+            outcome = ("The run may still be alive — its state is unknown and no exit was "
+                       "recorded. Output so far remains available via process(action='log'); "
+                       "the true completion will be delivered if supervision resumes.")
+        else:
+            outcome = (f"Exit {exit_code} was recorded but its delivery is not durable — "
+                       "operator triage required. Output so far remains available via "
+                       "process(action='log').")
         return (
             f"[Background process {session_id} ({command}) supervision LOST: {detail}. "
-            "The run may still be alive — its state is unknown and no exit was recorded. "
-            "Output so far remains available via process(action='log'); "
-            "the true completion will be delivered if supervision resumes.)")
+            f"{outcome})")
 
     def _format_process_final_message(self, session_id: str, session, notify_mode: str) -> str:
         """Human-facing completion message. Every mode shares the one-line status header; the
@@ -1862,6 +1872,22 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
         return "break"
 
+    @staticmethod
+    def _settle_suppressed_delivery(session_id: str) -> None:
+        """Ack a terminally suppressed completion without sending a message.
+
+        Off-mode and ownership-suppressed exits carry no user notice, but the
+        durable outbox must still settle: otherwise recovery re-arms a watcher
+        for a notice policy will suppress again (replay leak). Terminal only —
+        callers gate on ``session.exited`` so live jobs never settle here."""
+        try:
+            from tools.process_registry_delivery import ack_delivery
+            ack_delivery(session_id)
+        except (OSError, ValueError) as exc:
+            logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+        except Exception as exc:
+            logger.debug("Outbox ack failed for %s: %s", session_id, exc, exc_info=True)
+
     async def _run_process_watcher(self, watcher: dict) -> None:
         """Poll a background process and push updates until it exits. Mode
         (``display.background_process_notifications``): concise (default one-liner; failures append
@@ -1897,14 +1923,30 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 })
             await self._watcher_maybe_surface_unresolved(
                 session, session_id, platform_name, chat_id, thread_id, watcher, silent, surface)
+            if watcher.get("unresolved_escalation_replay"):
+                # Durable unresolved-finish replay: one explicit owner escalation,
+                # never the normal completion (which would duplicate it) and never
+                # a relaunched job (the session is finished). Policy-suppressed
+                # escalations settle without sending, like any terminal suppression.
+                if getattr(session, "_unresolved_surfaced", False):
+                    break
+                if getattr(session, "supervision_state", "ok") != "unresolved":
+                    break
+                if silent or not surface:
+                    session._unresolved_surfaced = True
+                    self._settle_suppressed_delivery(session_id)
+                    break
+                continue
             if not surface:
                 # Recheck live ownership next tick: handoff retains notification intent.
                 if session.exited:
+                    self._settle_suppressed_delivery(session_id)
                     break
                 continue
             if silent:
                 # Still wait for the process to exit so we can log it, but don't push any messages.
                 if session.exited:
+                    self._settle_suppressed_delivery(session_id)
                     break
                 continue
             current_output_len = len(session.output_buffer)
@@ -1915,6 +1957,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
+                        self._settle_suppressed_delivery(session_id)
                         break
                     action, completion_attempts, retry_interval = await self._watcher_deliver_agent_completion(
                         watcher, session, session_id, synth_text, completion_evt,

@@ -86,9 +86,18 @@ scoped to that admission replay, not to external actions.
 
 - The outbox write precedes the query-only result save and any finalized-state
   exposure: a crash between them leaves a recoverable pending event, never a silent loss.
+- When the outbox itself is unwritable but the checkpoint still is, the finish is
+  retained as a checkpoint `unresolved_finish` record (real exit preserved, never a
+  query-only orphan): a cold restart rebuilds the FINISHED session and re-arms one
+  explicit owner escalation — never a re-run, never a duplicate completion. The record
+  persists until that escalation is terminally delivered; when every persistence
+  channel is gone nothing durable can be promised (loud in-memory escalation only).
 - Retention is 7 days of delivery attempts. Expired undelivered records are never
   silently deleted: they are retained with `expired: true` and escalated once (loud,
   rate-limited), staying queryable for operator triage.
+- Finished-cache pruning never evicts a session with a pending outbox record or an
+  unsurfaced unresolved finish: the live watcher keeps retrying in-process without a
+  restart. Off-mode and ownership-suppressed exits settle the outbox without sending.
 - Checkpoints retain sandbox runs as `unresolved` (never dropped, never host-signalled),
   with error evidence and a re-armed watch route. `reattach_env_session` resumes one
   only after identity verification (container, token, wrapper start ticks + boot ID in
@@ -96,6 +105,28 @@ scoped to that admission replay, not to external actions.
 - Legacy receipts without stored ticks/token fail closed to `unknown`: explicit
   escalation, never a signal. PID-number equality alone never proves identity (PIDs
   recycle inside and outside the sandbox).
+
+## Kill identity limits (read this before claiming safety)
+
+- Sandbox kills are identity-safe pidfd helpers executed INSIDE the target
+  container over the `docker exec` transport: the helper opens a pidfd for the live
+  PID, verifies pid-file/token/start-ticks AFTER the open, then signals via
+  `pidfd_send_signal` in the SAME helper — no fd crosses the transport, so PID reuse
+  between authorization and signal cannot redirect to a stranger. The `docker exec`
+  argv carries the immutable expected container ID snapshot (never the mutable env
+  field); pre/post checks refuse on replacement/mutation with no backend
+  re-create. Missing inside-`python3`/pidfd exits unsupported (fail closed, no
+  shell-`kill` fallback); empty token/ticks refuse without signalling. Only one PID
+  is ever signalled via its pidfd, never a process group; post-signal verification
+  still decides the outcome fail-closed.
+- Recovered host kills refuse unverifiable identities outright (missing baseline or
+  unreadable start-time probe): zero signals, session kept `unresolved` for triage. A
+  proven identity passes its baseline through to termination, which revalidates at
+  signal time. Host Popen-tree kills go through psutil, whose terminate/kill already
+  revalidate recycled PIDs.
+- Exactly-once external actions are not guaranteed anywhere on this page: admission,
+  processing, and outbound delivery are separate receipts (see above), and escalation
+  redelivery after a crash-before-ack is possible by design.
 
 ## Failure matrix
 

@@ -1984,12 +1984,20 @@ class ProcessRegistry(ProcessSandboxMixin, ProcessTerminationMixin, ProcessCheck
         if session.detached and not session.output_log:
             result.update(detached=True, note="Process recovered after restart -- output history unavailable")
         if getattr(session, "supervision_state", "ok") != "ok":
-            result.update(
-                supervision_state=session.supervision_state,
-                supervision_note=(
+            if session.exit_code is None:
+                supervision_note = (
                     f"Supervision {session.supervision_state}: "
                     f"{session.last_supervision_error or 'backend unreachable'}. "
-                    "State is unknown; no exit has been recorded."))
+                    "State is unknown; no exit has been recorded.")
+            else:
+                supervision_note = (
+                    f"Supervision {session.supervision_state}: "
+                    f"{session.last_supervision_error or 'backend unreachable'}. "
+                    f"Exit {session.exit_code} was recorded but its delivery "
+                    "is not durable; operator triage required.")
+            result.update(
+                supervision_state=session.supervision_state,
+                supervision_note=supervision_note)
         return result
 
     def read_log(self, session_id: str, offset: int | None = None, limit: int = 200) -> dict:
@@ -2460,31 +2468,7 @@ class ProcessRegistry(ProcessSandboxMixin, ProcessTerminationMixin, ProcessCheck
             for r in results)
 
     # ----- Cleanup / Pruning -----
-
-    def _prune_if_needed(self):
-        """Drop expired finished sessions, then the oldest survivor while over
-        MAX_PROCESSES. Must hold _lock. A session whose scope stop is still pending is kept
-        either way: it is kill_all's only handle on a scope that may hold live descendants."""
-        now = time.time()
-        prunable = {sid: s for sid, s in self._finished.items() if not getattr(s, "_scope_stop_pending", False)}
-        expired = [sid for sid, s in prunable.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]
-        over_cap = len(self._running) + len(self._finished) - len(expired) >= MAX_PROCESSES
-        if over_cap and (survivors := [sid for sid in prunable if sid not in expired]):
-            expired.append(min(survivors, key=lambda sid: self._finished[sid].started_at))
-        for sid in expired:
-            # Belt-and-suspenders handle release: sessions normally arrive in
-            # _finished via _move_to_finished(), which already released their
-            # Popen/PTY handles — but any session inserted into _finished
-            # directly (defensive paths, historical checkpoints) would
-            # otherwise carry its OS handles to the grave unreleased. The
-            # release is idempotent, so double-closing is safe.
-            self._release_finished_handles(self._finished[sid])
-            del self._finished[sid]
-        # Belt-and-suspenders against module-lifetime growth: forget consumed /
-        # poll-observed marks for any session no longer tracked at all.
-        tracked = self._running.keys() | self._finished.keys()
-        self._completion_consumed &= tracked
-        self._poll_observed &= tracked
+    # ``_prune_if_needed`` lives in ``process_registry_checkpoint.py`` (retention home).
 
 
 

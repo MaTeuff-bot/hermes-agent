@@ -230,10 +230,26 @@ class ProcessTerminationMixin:
         the signal was sent and post-signal verification should decide the outcome."""
         from tools.process_registry_supervision import (
             _read_pid_file, _read_token_file, _read_wrapper_startticks,
-            _read_boot_id, sandbox_signal_verdict,
+            _read_boot_id, sandbox_signal_verdict, capture_sandbox_identity,
+            pinned_kill_execute as _pinned_kill, sandbox_pidfd_kill_command,
+            SANDBOX_PIDFD_UNSUPPORTED_EXIT,
             _SupervisionTransportError)
-        from tools.process_registry_supervision import pinned_launch_execute as _pinned_kill
         import shlex as _shlex
+        # Immutable snapshot: the shared env object may be mutated or the backend
+        # replaced between authorization and signal; the pinned kill carries the
+        # snapshot in the actual docker-exec argv (never the mutable field).
+        # The signal itself is an identity-safe pidfd helper executed INSIDE the
+        # target container: pidfd opened, identity verified AFTER open, signal
+        # sent via the fd in the SAME helper. No fd crosses the transport.
+        _expected_container, _ = capture_sandbox_identity(session.env_ref)
+        logger.debug("Sandbox kill %s container=%s",
+                     session_id, (_expected_container or "?")[:12])
+        _stored_token_early = getattr(session, "sandbox_run_token", "") or ""
+        _stored_ticks_early = getattr(session, "sandbox_wrapper_startticks", "") or ""
+        if not _stored_token_early or not _stored_ticks_early:
+            return {"status": "error",
+                    "error": f"Refusing to signal {session_id}: stored run identity "
+                             "incomplete (no token/start-ticks continuity proof)."}
         try:
             _live_pid = _read_pid_file(
                 session.env_ref, _shlex.quote(session.env_pid_path)) if session.env_pid_path else None
@@ -292,8 +308,24 @@ class ProcessTerminationMixin:
                          "PID reused by an unrelated process). "
                          "The recorded PID may belong to an unrelated process.",
             }
+        _kill_target = _live_pid if _live_pid is not None else session.pid
         try:
-            _pinned_kill(session.env_ref, f"kill {int(session.pid)} 2>/dev/null", timeout=5)
+            _kill_target = int(_kill_target)
+        except (TypeError, ValueError):
+            return {"status": "error",
+                    "error": f"Refusing to signal {session_id}: no verified numeric PID."}
+        _stored_token = _stored_token_early
+        _stored_ticks = _stored_ticks_early
+        try:
+            _kill_result = _pinned_kill(
+                session.env_ref, _expected_container,
+                sandbox_pidfd_kill_command(
+                    pid_path=session.env_pid_path or "",
+                    token_path=session.env_token_path or "" if _stored_token else "",
+                    live_pid=_kill_target,
+                    expected_token=_stored_token,
+                    expected_startticks=_stored_ticks),
+                timeout=5)
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Sandbox kill transport failed for %s: %s", session_id, exc, exc_info=True)
             return {"status": "error",
@@ -302,6 +334,18 @@ class ProcessTerminationMixin:
             logger.warning("Sandbox kill failed for %s: %s", session_id, exc, exc_info=True)
             return {"status": "error",
                     "error": f"Kill signal not confirmed for {session_id}: {exc}"}
+        _kill_code = int((_kill_result or {}).get("returncode", 1) or 0)
+        if _kill_code == int(SANDBOX_PIDFD_UNSUPPORTED_EXIT):
+            return {"status": "error",
+                    "error": f"Refusing to signal {session_id}: identity-safe helper "
+                             "unavailable inside the container (no python3/pidfd); "
+                             "fail-closed without a shell-kill fallback. Session kept "
+                             "running for operator triage."}
+        if _kill_code != 0:
+            return {"status": "error",
+                    "error": f"Kill refused at the signal boundary for {session_id} "
+                             "(pidfd helper re-check failed inside the signal exec; "
+                             "nothing was signalled to a stranger)."}
         return self._verify_sandbox_kill(session, session_id)
 
     def _verify_sandbox_kill(self, session: ProcessSession, session_id: str) -> Optional[dict]:
@@ -341,29 +385,70 @@ class ProcessTerminationMixin:
         except Exception as exc:
             logger.debug("Kill verify failed for %s: %s", session_id, exc, exc_info=True)
 
-    def _signal_kill_detached(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
-        """Kill a recovered host-PID session whose live identity was just proven."""
+    def _refuse_unverifiable_detached_kill(self, session: ProcessSession, session_id: str) -> dict:
+        """Fail closed on an unprovable recovered host identity: no signal is sent
+        (a recycled number could name a stranger); the session stays tracked as
+        ``unresolved`` with evidence for operator triage."""
+        with session._lock:
+            if not session.exited:
+                session.supervision_state = "unresolved"
+                session.last_supervision_error = (
+                    "Refusing to signal recovered host pid "
+                    f"{session.pid}: start-time identity unverifiable "
+                    "(no baseline or unreadable probe); the number may belong "
+                    "to an unrelated process.")[:300]
+        self._write_checkpoint()
+        logger.warning(
+            "Refusing to kill %s: recovered host identity unverifiable, kept unresolved",
+            session_id)
+        return {"status": "error",
+                "error": f"Refusing to signal {session_id}: recovered host identity "
+                         "unverifiable (no baseline or unreadable start-time probe). "
+                         "The PID may belong to an unrelated process; session kept "
+                         "as unresolved for operator triage."}
+
+    def _close_detached_without_signal(self, session: ProcessSession, session_id: str,
+                                       consume_output: bool) -> dict:
+        """Close a gone/recycled detached entry without signalling the PID."""
         from tools.process_registry import _completion_output
-        # Same fate as poll/list: a gone or reused PID means our process is
-        # gone — never tree-kill the stranger — but a live PID with an
-        # unreadable start time is still ours and must really be killed.
         # If this recovered session also carries an owned systemd scope, stop that scope before
         # returning: a daemonized descendant may still be alive there even though the wrapper PID exited
         # or was recycled across the gateway restart (#70716, teknium1 review).
+        scope_stopped = self._stop_scope(session)
+        with session._lock:
+            output = _completion_output(session)
+        if consume_output:
+            self._completion_consumed.add(session_id)
+        # No waitable handle, so this is not a collected exit. Close the
+        # entry without queueing a completion, and do not signal a PID
+        # whose start time does not match.
+        self._close_reused_detached(session)
+        result = {"status": "already_exited", "exit_code": session.exit_code, **output}
+        if not scope_stopped:
+            result["scope_stop_failed"] = session.systemd_unit
+        return result
+
+    def _signal_kill_detached(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
+        """Kill a recovered host-PID session only when its live identity is proven.
+
+        Fail closed: a missing baseline or an unreadable start-time probe means the
+        number may name a stranger — no signal is sent and the session is kept as
+        ``unresolved`` for triage. A proven match passes its baseline through to
+        ``_terminate_host_pid``, which revalidates once more at signal time."""
+        # Same fate as poll/list: a gone or reused PID means our process is
+        # gone — never tree-kill the stranger.
         if self._detached_host_fate(session.pid, session.host_start_time) != "running":
-            scope_stopped = self._stop_scope(session)
-            with session._lock:
-                output = _completion_output(session)
-            if consume_output:
-                self._completion_consumed.add(session_id)
-            # No waitable handle, so this is not a collected exit. Close the
-            # entry without queueing a completion, and do not signal a PID
-            # whose start time does not match.
-            self._close_reused_detached(session)
-            result = {"status": "already_exited", "exit_code": session.exit_code, **output}
-            if not scope_stopped:
-                result["scope_stop_failed"] = session.systemd_unit
-            return result
-        # Identity was just proven above. Re-passing the start time would make
-        # an unreadable probe refuse the kill and leave the re-adopted child running.
-        self._terminate_host_pid(session.pid)
+            return self._close_detached_without_signal(session, session_id, consume_output)
+        expected_start = session.host_start_time
+        if expected_start is None:
+            return self._refuse_unverifiable_detached_kill(session, session_id)
+        live_start = self._safe_host_start_time(session.pid)
+        if live_start is None:
+            return self._refuse_unverifiable_detached_kill(session, session_id)
+        if live_start != expected_start:
+            # The number recycled between the fate probe above and this probe:
+            # close without signalling, same as a reused fate.
+            return self._close_detached_without_signal(session, session_id, consume_output)
+        # Identity proven twice (fate above, fresh probe here); the passthrough
+        # revalidates once more inside _terminate_host_pid at signal time.
+        self._terminate_host_pid(session.pid, expected_start)

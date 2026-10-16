@@ -100,11 +100,12 @@ class TestCheckpointReadopt:
                 proc.kill()
                 proc.wait()
 
-    def test_kill_terminates_readopted_pid_when_start_probe_fails(
+    def test_kill_refuses_readopted_pid_when_start_probe_fails(
         self, registry, monkeypatch
     ):
-        """kill must reach a re-adopted live child with an unreadable start
-        time, not report already_exited and leave it running unsupervised."""
+        """R4: an unreadable start-time probe is unverifiable identity — kill must
+        refuse (never signal a possibly-recycled number) and keep the session
+        unresolved for triage instead of reporting killed."""
         proc = _sleep_proc()
         try:
             start = ProcessRegistry._safe_host_start_time(proc.pid)
@@ -114,9 +115,11 @@ class TestCheckpointReadopt:
 
             result = registry.kill_process(session.id)
 
-            assert result["status"] == "killed", result
-            proc.wait(timeout=10)
-            assert session.exited is True
+            assert result["status"] == "error", result
+            assert "unverifiable" in result.get("error", "")
+            assert session.supervision_state == "unresolved"
+            assert session.exited is False
+            assert proc.poll() is None
         finally:
             if proc.poll() is None:
                 proc.kill()

@@ -248,12 +248,16 @@ class _SandboxEnv:
     identity. Runs ``hooks[step]`` once so a test can land a kill at an exact
     point (``delta``/``exit``/``check``). ``receipt=None`` means no exit file yet
     (``__NO_RECEIPT__``); otherwise the receipt is ``"<token>\\n<code>\\n"``.
-    The ``kill <pid>`` signal flips ``alive`` to False so post-kill verification
-    observes the death instead of claiming a survivor."""
+    The pidfd helper (``pidfd_send_signal``) flips ``alive`` to False so
+    post-kill verification observes the death; a plain ``kill <pid>`` is unsafe
+    and never sent (recorded only to detect a regression). ``pidfd_supported``
+    models images with/without inside-python pidfd (False exits 10, fail
+    closed). The command log is bounded to fail fast instead of OOMing the
+    worker on an unbounded poll loop."""
 
     def __init__(self, *, delta="", alive=False, hooks=None, receipt=None,
                  token="tok-run-a", pid=4242, container="ctr-test",
-                 ticks="12345", boot="boot-test-1111"):
+                 ticks="12345", boot="boot-test-1111", pidfd_supported=True):
         self.delta = delta
         self.alive = alive
         self.hooks = dict(hooks or {})
@@ -262,8 +266,10 @@ class _SandboxEnv:
         self.pid = pid
         self.ticks = ticks
         self.boot = boot
+        self.pidfd_supported = pidfd_supported
         self._container_id = container
         self.commands = []
+        self.unsafe_kills = 0
 
     def _stat_output(self):
         fields = ["S", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
@@ -273,6 +279,14 @@ class _SandboxEnv:
 
     def execute(self, command, **_kwargs):
         self.commands.append(command)
+        if len(self.commands) > 500:
+            raise AssertionError(
+                f"unbounded poll loop: {len(self.commands)} execs without finish")
+        if "pidfd" in command:
+            if not self.pidfd_supported:
+                return {"output": "UNSUPPORTED\n", "returncode": 10}
+            self.alive = False
+            return {"output": "", "returncode": 0}
         if "boot_id" in command:
             return {"output": f"{self.boot}\n", "returncode": 0}
         if "/proc/" in command and "/stat" in command:
@@ -292,6 +306,7 @@ class _SandboxEnv:
                 hook()
             return {"output": "0\n" if self.alive else "1\n", "returncode": 0}
         if command.startswith("kill "):
+            self.unsafe_kills += 1
             self.alive = False
             return {"output": "", "returncode": 0}
         if command.startswith("O="):
@@ -359,19 +374,44 @@ def test_a_sandbox_exit_read_after_a_kill_keeps_the_kill(monkeypatch):
 
 
 def test_a_sandbox_lost_after_a_kill_keeps_the_kill(monkeypatch):
+    """Kill-wins over a lost backend: pidfd helper, bounded wall-clock and memory."""
+    import resource as _res
+    import time as _time
     registry = ProcessRegistry()
+    deadline = _time.monotonic() + 30.0
+    soft, hard = _res.getrlimit(_res.RLIMIT_AS)
+    cap = 2 * 1024 * 1024 * 1024
+    try:
+        _res.setrlimit(_res.RLIMIT_AS, (cap, hard))
+    except Exception:
+        pass
 
     def kill_then_lose_the_backend():
-        registry.kill_process("proc_sandbox")
+        if _time.monotonic() > deadline:
+            raise TimeoutError("test exceeded 30s without finishing")
+        if len(env.commands) > 400:
+            raise AssertionError("poll loop did not finish after pidfd kill")
+        result = registry.kill_process("proc_sandbox")
+        assert result.get("status") == "killed", result
+        assert env.unsafe_kills == 0, f"unsafe shell kill used: {env.commands[-1:]}"
+        assert any("pidfd" in c for c in env.commands), "pidfd helper never executed"
         raise RuntimeError("sandbox reaped")
 
     env = _SandboxEnv(alive=True, hooks={"check": kill_then_lose_the_backend})
     session = _sandbox_session(registry, monkeypatch, env)
 
-    _poll_sandbox(registry, session, env)
+    try:
+        _poll_sandbox(registry, session, env)
+    finally:
+        try:
+            _res.setrlimit(_res.RLIMIT_AS, (soft, hard))
+        except Exception:
+            pass
 
     assert (session.exit_code, session.completion_reason, session.termination_source) == (
         -15, "killed", "process.kill")
+    assert env.unsafe_kills == 0
+    assert any("pidfd" in c for c in env.commands)
 
 
 def test_a_lost_sandbox_without_a_kill_is_reported_lost(monkeypatch):

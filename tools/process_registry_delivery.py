@@ -83,6 +83,20 @@ def write_pending_delivery(session) -> bool:
         return False
 
 
+def has_pending_delivery(session_id: str) -> bool:
+    """True when an unacknowledged outbox record exists for the session.
+
+    The finished-cache prune consults this so an undelivered completion is never
+    evicted from the live retry path: the watcher resolves sessions via ``get``,
+    and a pruned session breaks the watcher without redelivery until restart.
+    Uncertain (unresolvable home) keeps the session — never silently drop work."""
+    try:
+        return (_delivery_dir() / f"{session_id}.json").exists()
+    except Exception:
+        logger.debug("Pending-delivery probe failed for %s", session_id, exc_info=True)
+        return True
+
+
 def ack_delivery(session_id: str) -> None:
     """Delete the pending record after admission + send success. Failed sends never call this."""
     try:
@@ -199,6 +213,59 @@ def write_pending_delivery_with_retry(session) -> tuple[bool, int]:
                 "Pending-delivery outbox not durable for %s (attempt %d/%d); retrying",
                 getattr(session, "id", "?"), attempts, bound)
     return False, attempts
+
+
+def build_unresolved_finish_record(session) -> dict:
+    """Checkpoint-fallback evidence for a finish whose outbox write failed.
+
+    The outbox (``logs/process-delivery/``) is the primary replay path; when it
+    is unavailable but the checkpoint file still is, this record rides the
+    checkpoint instead so a cold restart still re-arms an explicit owner
+    escalation. It is terminal evidence only (exit already recorded) — recovery
+    rebuilds a FINISHED session and never re-runs work. Preserved until the
+    escalation is terminally delivered (``_unresolved_surfaced``); when every
+    persistence channel is gone nothing durable can be promised and the caller
+    keeps the in-memory escalation only."""
+    try:
+        from agent.redact import redact_sensitive_text, redact_terminal_output
+        raw_output = getattr(session, "output_buffer", "") or ""
+        output_tail = redact_terminal_output(
+            raw_output[-4000:], getattr(session, "command", ""), force=True)
+        command = redact_sensitive_text(getattr(session, "command", ""), code_file=True)
+    except (ValueError, RuntimeError, OSError, AttributeError) as exc:
+        logger.debug("Unresolved-finish redact failed for %s: %s",
+                     getattr(session, "id", "?"), exc, exc_info=True)
+        output_tail = ""
+        command = getattr(session, "command", "") or ""
+    record = {
+        "session_id": getattr(session, "id", ""),
+        "unresolved_finish": True,
+        "command": command,
+        "output": output_tail,
+        "exit_code": getattr(session, "exit_code", None),
+        "completion_reason": getattr(session, "completion_reason", ""),
+        "termination_source": getattr(session, "termination_source", ""),
+        "supervision_state": "unresolved",
+        "supervision_failures": getattr(session, "supervision_failures", 0),
+        "last_supervision_error": getattr(session, "last_supervision_error", ""),
+        "outbox_failures": getattr(session, "_outbox_failures", 0),
+        "session_key": getattr(session, "session_key", ""),
+        "task_id": getattr(session, "task_id", ""),
+        "owner_task_id": getattr(session, "owner_task_id", ""),
+        "parent_session_id": getattr(session, "parent_session_id", ""),
+        "started_at": getattr(session, "started_at", time.time()),
+        "watcher_interval": getattr(session, "watcher_interval", 0),
+        "notify_on_complete": bool(getattr(session, "notify_on_complete", False)),
+        "created_at": time.time(),
+    }
+    for key in ("platform", "chat_id", "user_id", "user_name", "thread_id", "message_id"):
+        try:
+            record[f"watcher_{key}"] = getattr(session, f"watcher_{key}", "") or ""
+        except (AttributeError, ValueError) as exc:
+            logger.debug("Delivery route copy failed for %s key %s: %s",
+                         getattr(session, "id", "?"), key, exc, exc_info=True)
+            record[f"watcher_{key}"] = ""
+    return record
 
 
 def escalate_outbox_unresolved(session, attempts: int) -> None:

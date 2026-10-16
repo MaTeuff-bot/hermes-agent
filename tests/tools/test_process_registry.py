@@ -1333,6 +1333,7 @@ class TestKillProcess:
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
+        s.host_start_time = 777001
         registry._running[s.id] = s
 
         terminate_calls = []
@@ -1363,6 +1364,7 @@ class TestKillProcess:
             with patch("gateway.status._pid_exists", side_effect=lambda pid: kill_state["alive"]), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
+                 patch.object(ProcessRegistry, "_safe_host_start_time", return_value=777001), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
                 result = registry.kill_process(s.id)
 
@@ -1383,6 +1385,7 @@ class TestKillProcess:
         s = _make_session(sid="proc_kill_race", command="sleep 999")
         s.pid = 424243
         s.detached = True
+        s.host_start_time = 777002
         registry._running[s.id] = s
 
         def reader_wins_during_signal(pid, start=None):
@@ -1401,6 +1404,9 @@ class TestKillProcess:
             host_guard = patch.object(
                 ProcessRegistry, "_host_pid_is_ours", return_value=True
             )
+            probe_guard = patch.object(
+                ProcessRegistry, "_safe_host_start_time", return_value=777002
+            )
             term_patch = patch.object(
                 ProcessRegistry,
                 "_terminate_host_pid",
@@ -1409,7 +1415,7 @@ class TestKillProcess:
             saver = patch(
                 "tools.process_registry.save_completed_result", side_effect=record_save
             )
-            with host_guard, term_patch, saver:
+            with host_guard, probe_guard, term_patch, saver:
                 result = registry.kill_process(s.id)
 
             assert result["status"] == "killed"

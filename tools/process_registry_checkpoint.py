@@ -42,6 +42,21 @@ class ProcessCheckpointMixin:
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
                     entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
+                # Durable unresolved-finish fallback: a finish whose outbox write failed
+                # leaves no outbox file, so without this the checkpoint would carry no
+                # replayable evidence and a restart would lose the escalation. Retained
+                # here on EVERY write (not just the finishing one) until the escalation
+                # is terminally delivered (``_unresolved_surfaced``); when no persistence
+                # channel is writable nothing durable can be promised — the write below
+                # is best-effort and the in-memory escalation stays loud.
+                from tools.process_registry_delivery import build_unresolved_finish_record
+                for s in self._finished.values():
+                    if (getattr(s, "supervision_state", "ok") == "unresolved"
+                            and not getattr(s, "_unresolved_surfaced", False)):
+                        record = build_unresolved_finish_record(s)
+                        if record.get("session_id") and all(
+                                item.get("session_id") != record["session_id"] for item in entries):
+                            entries.append(record)
                 known = {*self._running, *self._finished}
             from hermes_cli.active_sessions import _FileLock
             from utils import atomic_json_write
@@ -64,10 +79,59 @@ class ProcessCheckpointMixin:
             on_disk = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             return []
-        return [entry for entry in on_disk if isinstance(entry, dict) and entry.get("session_id") not in known
-                and (log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
-                and (_exit_path(log).exists() or self._detached_host_fate(
-                    entry.get("pid"), entry.get("host_start_time")) == "running")]
+        kept = []
+        for entry in on_disk:
+            if not isinstance(entry, dict) or entry.get("session_id") in known:
+                continue
+            if entry.get("unresolved_finish"):
+                # Terminal evidence from another writer: never re-run, never dropped.
+                kept.append(entry)
+                continue
+            if ((log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
+                    and (_exit_path(log).exists() or self._detached_host_fate(
+                        entry.get("pid"), entry.get("host_start_time")) == "running")):
+                kept.append(entry)
+        return kept
+
+    def _prune_if_needed(self):
+        """Drop expired finished sessions, then the oldest survivor while over
+        MAX_PROCESSES. Must hold _lock. A session whose scope stop is still pending is kept
+        either way: it is kill_all's only handle on a scope that may hold live descendants.
+        Sessions with live delivery obligations are never pruned: a pending outbox
+        record or an unsurfaced unresolved-finish keeps the session resolvable via
+        ``get`` so the in-process watcher retries without a restart. The 7-day
+        outbox retention (never silently deleted, expired escalated) stays the
+        resource bound; unsurfaced unresolved entries persist until terminal
+        delivery ack, one small record each."""
+        from tools.process_registry import FINISHED_TTL_SECONDS, MAX_PROCESSES
+        from tools.process_registry_delivery import has_pending_delivery
+        now = time.time()
+        prunable = {
+            sid: s for sid, s in self._finished.items()
+            if not getattr(s, "_scope_stop_pending", False)
+            and not has_pending_delivery(sid)
+            and not (
+                getattr(s, "supervision_state", "ok") == "unresolved"
+                and not getattr(s, "_unresolved_surfaced", False))
+        }
+        expired = [sid for sid, s in prunable.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]
+        over_cap = len(self._running) + len(self._finished) - len(expired) >= MAX_PROCESSES
+        if over_cap and (survivors := [sid for sid in prunable if sid not in expired]):
+            expired.append(min(survivors, key=lambda sid: self._finished[sid].started_at))
+        for sid in expired:
+            # Belt-and-suspenders handle release: sessions normally arrive in
+            # _finished via _move_to_finished(), which already released their
+            # Popen/PTY handles — but any session inserted into _finished
+            # directly (defensive paths, historical checkpoints) would
+            # otherwise carry its OS handles to the grave unreleased. The
+            # release is idempotent, so double-closing is safe.
+            self._release_finished_handles(self._finished[sid])
+            del self._finished[sid]
+        # Belt-and-suspenders against module-lifetime growth: forget consumed /
+        # poll-observed marks for any session no longer tracked at all.
+        tracked = self._running.keys() | self._finished.keys()
+        self._completion_consumed &= tracked
+        self._poll_observed &= tracked
 
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
@@ -146,13 +210,22 @@ class ProcessCheckpointMixin:
             _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
         )
         from tools.process_registry_output_log import adoptable_log
+        if entry.get("unresolved_finish"):
+            return self._adopt_unresolved_finish_entry(entry)
         pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
         if not pid and pid_scope == "host":
             return 0
         # The registry is process-global, so every profile's checkpoint carries every live
         # process; a multiplexer recovering several homes must adopt each session once.
+        # Both stores (plus already-queued watchers) decide: a stale entry for a session
+        # the outbox replay already rebuilt as finished must not adopt a second RUNNING
+        # twin or queue a duplicate watcher.
         with self._lock:
-            already_tracked = entry.get("session_id") in self._running
+            already_tracked = (
+                entry.get("session_id") in self._running
+                or entry.get("session_id") in self._finished
+                or entry.get("session_id") in {
+                    w.get("session_id") for w in self.pending_watchers})
         if already_tracked:
             return 0
         if pid_scope != "host":
@@ -225,6 +298,66 @@ class ProcessCheckpointMixin:
                 "parent_session_id": session.parent_session_id,
             })
         return 1
+    def _adopt_unresolved_finish_entry(self, entry: dict[str, Any]) -> int:
+        """Rebuild a finished-unresolved session from checkpoint fallback evidence.
+
+        The outbox write failed at finish time, so no outbox file exists; this
+        checkpoint record is the only replayable escalation route. The rebuilt
+        session is FINISHED (exit already recorded — never re-run, never a new
+        completion) with an explicitly flagged escalation watcher, so the gateway
+        sends one owner escalation instead of a query-only result. Returns 1 when
+        adopted, 0 when another store already holds the session."""
+        from tools.process_registry import ProcessSession, _WATCHER_ROUTE_KEYS
+        session_id = entry.get("session_id", "")
+        if not session_id:
+            return 0
+        with self._lock:
+            if (session_id in self._running or session_id in self._finished
+                    or session_id in {w.get("session_id") for w in self.pending_watchers}):
+                return 0
+            session = ProcessSession(
+                id=session_id,
+                command=entry.get("command", "unknown"),
+                task_id=entry.get("task_id", ""),
+                owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
+                session_key=entry.get("session_key", ""),
+                parent_session_id=entry.get("parent_session_id", ""),
+                started_at=entry.get("started_at", time.time()),
+                exit_code=entry.get("exit_code"),
+                completion_reason=entry.get("completion_reason", "exited"),
+                termination_source=entry.get("termination_source", ""),
+                supervision_state="unresolved",
+                supervision_failures=int(entry.get("supervision_failures", 0) or 0),
+                last_supervision_error=entry.get("last_supervision_error", ""),
+                output_buffer=entry.get("output", "") or "",
+                exited=True,
+                watcher_platform=entry.get("watcher_platform", ""),
+                watcher_chat_id=entry.get("watcher_chat_id", ""),
+                watcher_user_id=entry.get("watcher_user_id", ""),
+                watcher_user_name=entry.get("watcher_user_name", ""),
+                watcher_thread_id=entry.get("watcher_thread_id", ""),
+                watcher_message_id=entry.get("watcher_message_id", ""),
+                watcher_interval=int(entry.get("watcher_interval", 0) or 0),
+                notify_on_complete=bool(entry.get("notify_on_complete", False)),
+                pid=None, pid_scope="host", detached=True,
+            )
+            session._outbox_failures = int(entry.get("outbox_failures", 0) or 0)
+            session._completion_event.set()
+            self._finished[session.id] = session
+            self.pending_watchers.append({
+                "session_id": session.id,
+                "check_interval": session.watcher_interval or 5,
+                "session_key": session.session_key,
+                **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+                "notify_on_complete": session.notify_on_complete,
+                "parent_session_id": session.parent_session_id,
+                "unresolved_escalation_replay": True,
+            })
+        logger.warning(
+            "Replaying durable unresolved finish: %s (exit=%s, escalation re-armed)",
+            session_id, entry.get("exit_code"))
+        return 1
+
     def _rebuild_pending_delivery_session(self, record: dict[str, Any]) -> None:
         """Rebuild a finished terminal session from a pending-delivery record.
 

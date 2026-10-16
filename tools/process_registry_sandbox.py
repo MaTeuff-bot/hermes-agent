@@ -139,26 +139,60 @@ class ProcessSandboxMixin:
         except Exception as exc:
             logger.debug("Spawn identity capture failed for %s: %s", getattr(session, "id", "?"), exc, exc_info=True)
 
-    def _finish_env_exit(self, session: ProcessSession, exit_code: int) -> None:
-        """Finish on a verified wrapper exit receipt (a raced kill keeps its own)."""
-        self._finish_exited(session, exit_code, reason="exited", source="")
+    @staticmethod
+    def _generation_current(session: ProcessSession, expected_generation) -> bool:
+        """True when a poller's captured epoch still owns the session.
 
-    def _note_supervision_degraded(self, session: ProcessSession, error: str, failures: int) -> None:
+        ``reattach_env_session`` bumps ``_supervision_generation`` and starts a new
+        poller; an older poller blocked in transport must not commit state (a stale
+        reconcile would mark a freshly reattached run unresolved and stop its new
+        poller). ``None`` means unguarded (non-poller callers). Decided under the
+        session lock by callers."""
+        return expected_generation is None or (
+            session._supervision_generation == expected_generation)
+
+    def _finish_env_exit(self, session: ProcessSession, exit_code: int,
+                         expected_generation=None) -> None:
+        """Finish on a verified wrapper exit receipt (a raced kill keeps its own).
+
+        Generation commit is atomic: the epoch check and the exit mark hold the
+        same session-lock acquisition (``session._lock`` is not re-entrant, so the
+        durable move follows outside). A reattach cannot bump between the check
+        and the mark and then lose to a stale finish; a stale poller never marks.
+        The current generation owns the receipt read and finishes itself."""
+        with session._lock:
+            if session.exited:
+                return
+            if not self._generation_current(session, expected_generation):
+                return
+            session.mark_exited(exit_code, reason="exited", source="")
+        self._move_to_finished(session)
+
+    def _note_supervision_degraded(self, session: ProcessSession, error: str, failures: int,
+                                   expected_generation=None) -> None:
         """Record one uncertain cycle; the session keeps running and retrying."""
         with session._lock:
             if session.exited:
+                return
+            if not self._generation_current(session, expected_generation):
                 return
             session.supervision_state = "degraded"
             session.supervision_failures = failures
             session.last_supervision_error = error[:300]
 
-    def _mark_supervision_unresolved(self, session: ProcessSession, error: str) -> None:
+    def _mark_supervision_unresolved(self, session: ProcessSession, error: str,
+                                     expected_generation=None) -> None:
         """Durable escalation: the retry bound is exhausted (or identity changed) with
         no verified exit. The session stays tracked with its evidence — checkpointed,
         visible to poll(), surfaced once by the gateway watcher — and is never finished
-        with an invented exit code. ``reattach_env_session`` can still resume it."""
+        with an invented exit code. ``reattach_env_session`` can still resume it.
+
+        Generation-guarded: a stale poller never overwrites the generation that
+        reattached after it."""
         with session._lock:
             if session.exited:
+                return
+            if not self._generation_current(session, expected_generation):
                 return
             session.supervision_state = "unresolved"
             session.supervision_failures += 1
