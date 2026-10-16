@@ -146,8 +146,14 @@ def test_owner_scope_preserved_for_delegated_lifetime():
         registry._running.pop(session.id, None)
 
 
-def test_outbox_disk_failure_keeps_session_running(monkeypatch, tmp_path):
-    """Outbox write failure never finishes the session (visible, retryable)."""
+def test_outbox_disk_failure_escalates_with_evidence(monkeypatch, tmp_path):
+    """Permanent outbox failure finishes honestly with retained evidence.
+
+    Bounded synchronous retry inside the production finisher, then an explicit
+    ``unresolved`` marker: the real exit is preserved, the query-only result is
+    retained best-effort, one completion event is queued (never a silent stop),
+    and poll stays honest. No endless poll or watcher CPU.
+    """
     import hermes_constants
     import tools.process_registry_delivery as delivery
 
@@ -161,15 +167,31 @@ def test_outbox_disk_failure_keeps_session_running(monkeypatch, tmp_path):
     from tools.process_registry import ProcessSession
     pending = ProcessSession(
         id="proc_disk_fail", command="echo hi", task_id="t",
-        owner_task_id="t", started_at=time.time(), exit_code=0,
-        completion_reason="exited", output_buffer="hi\n", exited=False,
+        owner_task_id="t", started_at=time.time(),
+        output_buffer="hi\n", exited=False,
         watcher_interval=5, notify_on_complete=True,
         session_key="k", parent_session_id="p")
     fresh._running[pending.id] = pending
-    monkeypatch.setattr(delivery, "write_pending_delivery", lambda _s: False)
-    assert fresh._move_to_finished(pending) is False
-    assert pending.id in fresh._running
-    assert pending.exited is False
+    calls = {"n": 0}
+
+    def always_fail(_s):
+        calls["n"] += 1
+        return False
+
+    monkeypatch.setattr(delivery, "write_pending_delivery", always_fail)
+    bound = delivery.outbox_failure_bound()
+    fresh._finish_exited(pending, 0)
+    assert calls["n"] == bound
+    assert pending.id not in fresh._running
+    assert pending.id in fresh._finished
+    assert pending.exited is True
+    assert pending.exit_code == 0
+    assert pending.completion_reason == "exited"
+    assert getattr(pending, "supervision_state", "ok") == "unresolved"
+    assert fresh.completion_queue.qsize() == 1
+    polled = fresh.poll(pending.id)
+    assert polled["status"] == "exited"
+    assert polled.get("supervision_state") == "unresolved"
 
 
 def test_expired_outbox_retained_and_escalated(monkeypatch, tmp_path):

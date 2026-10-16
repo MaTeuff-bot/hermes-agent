@@ -620,6 +620,7 @@ class ProcessSession:
     _watch_consecutive_strikes: int = field(default=0, repr=False)
     _supervision_generation: int = field(default=0, repr=False)  # poller epoch; reattach bumps it
     _unresolved_surfaced: bool = field(default=False, repr=False)  # gateway already sent the notice
+    _outbox_failures: int = field(default=0, repr=False)  # durable-write attempts for the finishing exit
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     # Set by the _move_to_finished call that moved the session out of _running; only that call
     # publishes the completion, so a duplicate finisher must not release waiters early.
@@ -1515,30 +1516,22 @@ class ProcessRegistry(ProcessSandboxMixin, ProcessTerminationMixin, ProcessCheck
                 # finalized-state exposure: a crash between them must leave a
                 # recoverable pending event, never a silent loss. Disk failures
                 # are visible (warning with traceback), never swallowed.
-                try:
-                    from tools.process_registry_delivery import write_pending_delivery
-                    outbox_ok = bool(write_pending_delivery(session))
-                except Exception:
-                    logger.warning(
-                        "Pending-delivery outbox write failed for %s; result not yet saved",
-                        session.id, exc_info=True)
-                    outbox_ok = False
-                if not outbox_ok and (
-                        getattr(session, "watcher_interval", 0) > 0
-                        or getattr(session, "notify_on_complete", False)):
-                    logger.warning(
-                        "Outbox not durable for %s; keeping session running for retry, not finished",
-                        session.id)
-                    session._finish_claimed = False
-                    return False
+                routed = (getattr(session, "watcher_interval", 0) > 0
+                          or getattr(session, "notify_on_complete", False))
+                if routed:
+                    from tools.process_registry_delivery import (
+                        escalate_outbox_unresolved, write_pending_delivery_with_retry)
+                    outbox_ok, attempts = write_pending_delivery_with_retry(session)
+                    if outbox_ok:
+                        session._outbox_failures = 0
+                    else:
+                        escalate_outbox_unresolved(session, attempts)
                 try:
                     save_completed_result(session)
                 except Exception:
                     logger.warning(
-                        "Result save failed for %s after outbox write; staying running",
+                        "Result save failed for %s; finishing with evidence retained",
                         session.id, exc_info=True)
-                    session._finish_claimed = False
-                    return False
                 self._running.pop(session.id)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every

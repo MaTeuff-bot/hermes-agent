@@ -163,21 +163,57 @@ def list_pending_deliveries(*, include_expired: bool = True) -> list:
     return records
 
 
-def reconcile_finished_without_outbox(session) -> bool:
-    """Re-create an outbox record for a finished routed session lacking one.
-
-    Crash between outbox and result save must not lose the notification: if the
-    query-only result exists but no pending file does, rebuild it. Returns True
-    when a record is now present.
-    """
+def outbox_failure_bound() -> int:
+    """Retry bound for durable writes; reuses the supervision bounded policy."""
     try:
-        directory = _delivery_dir()
-        if (directory / f"{session.id}.json").exists():
-            return True
-        return bool(write_pending_delivery(session))
-    except (OSError, ValueError, RuntimeError) as exc:
-        logger.warning("Outbox reconcile failed for %s: %s", getattr(session, "id", "?"), exc, exc_info=True)
-        return False
-    except Exception as exc:
-        logger.warning("Outbox reconcile failed for %s: %s", getattr(session, "id", "?"), exc, exc_info=True)
-        return False
+        from tools.process_registry_supervision import ENV_SUPERVISION_MAX_FAILURES
+        return int(ENV_SUPERVISION_MAX_FAILURES)
+    except (ImportError, AttributeError, ValueError, TypeError):
+        return 5
+
+
+def write_pending_delivery_with_retry(session) -> tuple[bool, int]:
+    """Bounded synchronous outbox retry for the finisher.
+
+    One finisher call retries a transient disk failure in place, so the local
+    reader (single ``_finish_exited``) and the sandbox poller need no second
+    pass: fail once then recover still yields one event and one receipt.
+    No sleep, no threads, no watcher CPU: at most ``outbox_failure_bound``
+    immediate attempts. Returns ``(ok, attempts)``.
+    """
+    bound = outbox_failure_bound()
+    attempts = 0
+    while attempts < bound:
+        attempts += 1
+        try:
+            ok = bool(write_pending_delivery(session))
+        except Exception:
+            logger.warning(
+                "Pending-delivery outbox write failed for %s (attempt %d/%d)",
+                getattr(session, "id", "?"), attempts, bound, exc_info=True)
+            ok = False
+        if ok:
+            return True, attempts
+        if attempts < bound:
+            logger.warning(
+                "Pending-delivery outbox not durable for %s (attempt %d/%d); retrying",
+                getattr(session, "id", "?"), attempts, bound)
+    return False, attempts
+
+
+def escalate_outbox_unresolved(session, attempts: int) -> None:
+    """Durable escalation after exhausted synchronous retry.
+
+    The real exit is preserved (never overwritten); the session carries an
+    explicit ``unresolved`` marker with evidence instead of stopping silently.
+    The caller still finishes honestly: query-only result best-effort,
+    in-memory completion queued, checkpoint best-effort.
+    """
+    session._outbox_failures = int(attempts or 0)
+    session.supervision_state = "unresolved"
+    session.last_supervision_error = (
+        f"Pending delivery outbox unavailable after {attempts} attempts; "
+        "exit recorded, notification not durable, operator triage required")[:300]
+    logger.warning(
+        "Pending delivery %s unresolved after %d attempts; exit recorded, not durable",
+        getattr(session, "id", "?"), attempts)
