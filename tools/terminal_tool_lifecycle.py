@@ -142,27 +142,78 @@ def _unregister_env(task_id: str):
     return env
 
 
+def _is_env_leased(registry: object, container_key: str, env: object) -> bool:
+    """True when a tracked running job is leased to ``container_key``/``env``."""
+    query = getattr(registry, "has_active_for_container", None)
+    if query is None:
+        return False
+    try:
+        return bool(query(container_key, env))
+    except (AttributeError, ValueError, RuntimeError) as exc:
+        logger.debug("Leased-env check failed for %s: %s", container_key, exc, exc_info=True)
+        return False
+    except Exception as exc:
+        logger.debug("Leased-env check failed for %s: %s", container_key, exc, exc_info=True)
+        return False
+
+
+def _refresh_leased_activity(registry: object, snapshot: list, current_time: float) -> None:
+    """Refresh activity for containers with leased running jobs."""
+    from tools.terminal_tool import _env_lock, _last_activity
+    for task_id, env in snapshot:
+        if _is_env_leased(registry, task_id, env):
+            with _env_lock:
+                if task_id in _last_activity:
+                    _last_activity[task_id] = current_time
+
+
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
-    """Clean up environments that have been inactive for longer than lifetime_seconds."""
+    """Clean up environments that have been inactive for longer than lifetime_seconds.
+
+    Container scope, not owner scope: a ``default`` container running a job
+    owned by ``raw-session-owner`` is leased via ``session.task_id``/``env_ref``
+    and must never read as idle. Automatic teardown never invalidates a leased
+    env (including ``persist_on_release`` jobs); explicit teardown
+    (``cleanup_vm(force_remove=True)``, host shutdown) keeps deliberate stop
+    semantics and still runs ``env.cleanup()``.
+    """
     from tools.terminal_tool import (
         _active_environments, _creation_locks, _creation_locks_lock, _env_lock,
         _last_activity,
     )
     current_time = time.time()
 
-    # Sandboxes with active background processes stay alive (refresh activity).
     try:
         from tools.process_registry import process_registry
-        for task_id in list(_last_activity.keys()):
-            if process_registry.has_active_processes(task_id):
-                _last_activity[task_id] = current_time
-    except ImportError:
-        pass
+    except (ImportError, AttributeError) as exc:
+        logger.debug("Leased-env refresh unavailable: %s", exc, exc_info=True)
+        process_registry = None  # type: ignore[assignment]
+    except Exception as exc:
+        logger.debug("Leased-env refresh unavailable: %s", exc, exc_info=True)
+        process_registry = None  # type: ignore[assignment]
+    if process_registry is not None:
+        try:
+            with _env_lock:
+                snapshot = [(k, _active_environments.get(k)) for k in list(_last_activity.keys())]
+        except (AttributeError, RuntimeError) as exc:
+            logger.debug("Env snapshot failed: %s", exc, exc_info=True)
+            snapshot = []
+        except Exception as exc:
+            logger.debug("Env snapshot failed: %s", exc, exc_info=True)
+            snapshot = []
+        _refresh_leased_activity(process_registry, snapshot, current_time)
 
     # Phase 1: unregister stale entries atomically under the lock; phase 2:
     # stop them outside it (see _unregister_env for why).
     with _env_lock:
         stale = [t for t, last in list(_last_activity.items()) if current_time - last > lifetime_seconds]
+        if process_registry is not None:
+            kept: list[str] = []
+            for key in stale:
+                if _is_env_leased(process_registry, key, _active_environments.get(key)):
+                    _last_activity[key] = current_time
+                    kept.append(key)
+            stale = [k for k in stale if k not in kept]
         envs_to_stop = [(t, _active_environments.pop(t, None)) for t in stale]
         for t in stale:
             _last_activity.pop(t, None)

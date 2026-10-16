@@ -23,8 +23,11 @@ ENV_SUPERVISION_MAX_FAILURES = 5
 ENV_SUPERVISION_BACKOFF_BASE_S = 2.0
 ENV_SUPERVISION_BACKOFF_CAP_S = 30.0
 
-# Exit code GNU ``timeout`` reports when the job budget fires.
-BUDGET_TIMEOUT_EXIT = 124
+# Job budgets are caller-owned, never terminal-owned. ``spawn_via_env(timeout=...)``
+# is the transport/start timeout only (launch + probes); it never bounds the job.
+# A caller that needs a bound wraps its own command with GNU ``timeout``
+# (TERM then KILL grace, exit 124 even if the child exits 0 after TERM).
+# No default budget is imposed: background servers must not be killed.
 
 
 class _SupervisionTransportError(Exception):
@@ -120,29 +123,121 @@ def sandbox_identity_verdict(
     return "unknown"
 
 
-def budget_wrapper_inner(command: str, budget_seconds: Any, quote) -> str:
-    """The inner command for the ``spawn_via_env`` nohup wrapper.
+def sandbox_wrapper_inner(command: str, quote) -> str:
+    """The inner command for the ``spawn_via_env`` nohup wrapper, always unbounded.
 
-    ``budget_seconds`` is an explicit job budget owned by the wrapper, independent
-    of client polling: GNU ``timeout`` sends TERM at the budget and the wrapper's
-    exit file keeps 124, so a later exit 0 of the child can never overwrite the
-    timeout verdict. ``None`` leaves the wrapper unbounded, as before.
+    No job budget is imposed here: background servers must not be killed by a
+    default. A caller that needs a bound owns it (GNU ``timeout -s TERM -k 5 N``),
+    which reports 124 even if the child exits 0 after TERM.
     """
-    if budget_seconds is None:
-        return f"bash -lc {quote(command)}"
-    budget = int(budget_seconds)
-    if budget <= 0:
-        raise ValueError(f"budget_seconds must be positive (got {budget_seconds!r})")
-    return f"timeout -s TERM -k 5 {budget} bash -lc {quote(command)}"
+    return f"bash -lc {quote(command)}"
 
 
-def budget_completion_reason(exit_code: int, budget_seconds: int) -> tuple[str, str]:
-    """(reason, source) for a verified wrapper exit: a 124 under a budget is the
-    budget firing, still a non-success even though the child may have exited 0
-    after the signal — the recorded code is the wrapper's, never the child's."""
-    if budget_seconds and exit_code == BUDGET_TIMEOUT_EXIT:
-        return "budget_timeout", "budget"
-    return "exited", ""
+def _parse_proc_stat_startticks(stat_text: str) -> Optional[str]:
+    """Kernel start ticks (field 22) from ``/proc/<pid>/stat``, or None.
+
+    The comm field may contain spaces/parens, so split after the last ``)``.
+    A malformed read is None (fail closed), never a guessed identity."""
+    try:
+        text = (stat_text or "").strip()
+        if not text:
+            return None
+        after = text.rsplit(")", 1)[-1].strip() if ")" in text else text
+        parts = after.split()
+        if ")" in text:
+            if len(parts) < 20:
+                return None
+            return parts[19]
+        if len(parts) < 22:
+            return None
+        return parts[21]
+    except (ValueError, IndexError):
+        return None
+
+
+def _read_wrapper_startticks(env: Any, quoted_pid_path: str) -> Optional[str]:
+    """Live start ticks for the wrapper PID, or None when gone/unreadable-clean.
+
+    Transport failures raise ``_SupervisionTransportError`` (uncertain, retry);
+    a clean transport with no parseable ticks is None (fail closed: no signal,
+    no finish as exit, escalate to ``unknown``).
+    """
+    try:
+        result = _pinned_env_exec(
+            env, f"cat /proc/$(cat {quoted_pid_path} 2>/dev/null)/stat 2>/dev/null", 5)
+    except _ContainerReplacedError:
+        raise
+    except _SupervisionTransportError:
+        raise
+    except Exception as exc:
+        raise _SupervisionTransportError(f"startticks read: {exc}") from exc
+    if int(result.get("returncode", 0) or 0) != 0:
+        raise _SupervisionTransportError(
+            f"startticks read transport failed: {result.get('output', '')[:120]}")
+    return _parse_proc_stat_startticks(result.get("output", ""))
+
+
+def _read_boot_id(env: Any) -> Optional[str]:
+    """Host/container boot ID via the pinned path, or None when unreadable-clean."""
+    try:
+        result = _pinned_env_exec(
+            env, "cat /proc/sys/kernel/random/boot_id 2>/dev/null", 5)
+    except _ContainerReplacedError:
+        raise
+    except _SupervisionTransportError:
+        raise
+    except Exception as exc:
+        raise _SupervisionTransportError(f"boot-id read: {exc}") from exc
+    if int(result.get("returncode", 0) or 0) != 0:
+        raise _SupervisionTransportError(
+            f"boot-id read transport failed: {result.get('output', '')[:120]}")
+    lines = [ln.strip() for ln in result.get("output", "").splitlines() if ln.strip()]
+    return lines[0] if lines else None
+
+
+def sandbox_signal_verdict(
+    stored_container_id: str,
+    stored_pid: Optional[int],
+    env: Any,
+    pid_file_value: Optional[int] = None,
+    stored_token: str = "",
+    live_token: Optional[str] = None,
+    stored_startticks: str = "",
+    live_startticks: Optional[str] = None,
+    stored_boot_id: str = "",
+    live_boot_id: Optional[str] = None,
+) -> str:
+    """``match`` / ``mismatch`` / ``unknown`` for signalling a sandbox run.
+
+    Extends :func:`sandbox_identity_verdict` with live ``/proc`` binding in the
+    same pinned execution namespace: the token proves the run, the container ID
+    proves no replacement, and the wrapper start ticks (+ boot ID when known)
+    prove the live PID is still the spawned wrapper shell, not a reused number.
+    A stale token/PID file with a reused PID (same container, same number, old
+    token) is ``mismatch`` when the live start ticks differ, ``unknown`` when
+    the live ticks cannot be read. Legacy runs without stored ticks are
+    ``unknown`` (fail closed: explicit escalate, never signal).
+    """
+    base = sandbox_identity_verdict(
+        stored_container_id, stored_pid, env, pid_file_value, stored_token, live_token)
+    if base != "match":
+        return base
+    if stored_startticks:
+        if live_startticks is None:
+            return "unknown"
+        if live_startticks != stored_startticks:
+            return "mismatch"
+    else:
+        return "unknown"
+    if stored_boot_id:
+        if live_boot_id is None:
+            return "unknown"
+        if live_boot_id != stored_boot_id:
+            return "mismatch"
+    if pid_file_value is not None and stored_pid is not None:
+        if pid_file_value != stored_pid:
+            return "mismatch"
+    return "match"
 
 
 def _read_pid_file(env: Any, quoted_pid_path: str) -> Optional[int]:
@@ -196,14 +291,24 @@ def _is_recreating_docker_env(env: Any) -> bool:
     """True for backends whose ``execute`` recreates a gone container and retries.
 
     ``isinstance`` when the class imports, else duck-typing on the recreate
-    marker so test fakes and renamed subclasses still pin correctly.
+    marker so test fakes and renamed subclasses still pin correctly. A
+    subprocess-backed test fake that subclasses ``DockerEnvironment`` only for
+    its ``_container_id`` identity/cleanup (no ``_docker_exe``/``cwd`` Base
+    init, ``execute`` overridden to a local backend) is NOT recreating: its
+    ``execute`` already asserts the handle and never recreates, so pinned
+    probes must use it directly. Real Docker backends always carry the Base
+    execution state, so this never misreports a real engine.
     """
     try:
         from tools.environments.docker import DockerEnvironment
         if isinstance(env, DockerEnvironment):
+            if type(env).execute is not DockerEnvironment.execute:
+                return False
+            if not (hasattr(env, "_docker_exe") and hasattr(env, "cwd")):
+                return False
             return True
-    except Exception:
-        pass
+    except ImportError as exc:
+        logger.debug("Docker backend unavailable for recreate check: %s", exc, exc_info=True)
     return type(getattr(env, "__class__", None)).__name__ == "DockerEnvironment" or (
         hasattr(env, "_recreate_container") and hasattr(env, "_container_id"))
 
@@ -351,12 +456,9 @@ def run_env_supervision(
                 session.last_supervision_error = ""
 
 
-def _poll_cycle(
-    registry: Any, session: Any, env: Any, q: Any,
-    log_path: str, pid_path: str, exit_path: str, prev_output_bytes: int,
-) -> int:
-    """One full poll cycle; returns the new log offset. Raises
-    ``_SupervisionTransportError`` on any uncertain probe."""
+def _poll_ingest_log(registry: Any, session: Any, env: Any, q: Any,
+                     log_path: str, prev_output_bytes: int) -> int:
+    """One log-delta read; returns the new offset. Raises on uncertain transport."""
     raw = _exec_probe_pinned(
         env, registry._log_delta_command(q(log_path), prev_output_bytes),
         timeout=10, label="log read")
@@ -382,7 +484,92 @@ def _poll_cycle(
                 session.output_buffer = session.output_buffer[-session.max_output_chars:]
         registry._check_watch_patterns(session, delta)
         registry._emit_output(session, delta)
+    return prev_output_bytes
 
+
+def _poll_drain_final_log(registry: Any, session: Any, env: Any, q: Any,
+                          log_path: str, prev_output_bytes: int) -> int:
+    """Best-effort final log drain after a verified receipt; never fails the finish."""
+    try:
+        raw = _exec_probe_pinned(
+            env, registry._log_delta_command(q(log_path), prev_output_bytes),
+            timeout=10, label="final log drain")
+    except _SupervisionTransportError as exc:
+        logger.debug("Final log drain uncertain, finishing from receipt: %s", exc, exc_info=True)
+        return prev_output_bytes
+    header, _, delta = raw.partition("\n")
+    try:
+        size_str, _offset_str = header.split()
+        prev_output_bytes = int(size_str)
+    except ValueError:
+        logger.debug("Final log drain header unusable: %r", header[:120], exc_info=True)
+    if delta:
+        with session._lock:
+            if not session.exited:
+                session.output_buffer += delta
+                if len(session.output_buffer) > session.max_output_chars:
+                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
+    return prev_output_bytes
+
+
+def _poll_handle_receipt(registry: Any, session: Any, env: Any, q: Any,
+                         log_path: str, exit_path: str, prev_output_bytes: int,
+                         stored_token: str, live_token: Optional[str]) -> Optional[int]:
+    """Verified-receipt phase; returns new offset when handled, None to continue."""
+    try:
+        receipt = _read_exit_receipt(env, q(exit_path), stored_token)
+    except _ContainerReplacedError as exc:
+        registry._mark_supervision_unresolved(session, str(exc))
+        return prev_output_bytes
+    if receipt is None:
+        return None
+    if sandbox_identity_verdict(
+            session.sandbox_container_id, session.sandbox_pid, env,
+            None, stored_token, live_token) != "match":
+        registry._mark_supervision_unresolved(
+            session, "exit receipt present but run identity unverified (refusing to trust it)")
+        return prev_output_bytes
+    prev_output_bytes = _poll_drain_final_log(
+        registry, session, env, q, log_path, prev_output_bytes)
+    registry._finish_env_exit(session, receipt)
+    return prev_output_bytes
+
+
+def _poll_check_liveness(registry: Any, session: Any, env: Any, q: Any,
+                         pid_path: str, stored_token: str,
+                         live_token: Optional[str]) -> Optional[int]:
+    """Liveness phase; returns offset when resolved, None never (raises or escalates)."""
+    verdict = sandbox_identity_verdict(
+        session.sandbox_container_id, session.sandbox_pid, env,
+        None, stored_token, live_token)
+    if verdict == "mismatch":
+        registry._mark_supervision_unresolved(
+            session, "sandbox run identity changed (replacement, not continuity)")
+        return 0
+    if verdict == "unknown":
+        raise _SupervisionTransportError(
+            "sandbox run identity unverifiable (no token/container continuity proof)")
+    alive_raw = _exec_probe_pinned(
+        env, f"kill -0 \"$(cat {q(pid_path)} 2>/dev/null)\" 2>/dev/null; echo $?",
+        timeout=5, label="liveness probe")
+    if alive_raw.strip().splitlines()[-1].strip() == "0":
+        return 0
+    pid_value = _read_pid_file(env, q(pid_path))
+    if sandbox_identity_verdict(
+            session.sandbox_container_id, session.sandbox_pid, env, pid_value,
+            stored_token, live_token) != "match":
+        registry._mark_supervision_unresolved(
+            session, "worker unreachable and wrapper identity changed (no verified exit receipt)")
+        return 0
+    raise _SupervisionTransportError("worker not alive and no exit receipt yet")
+
+
+def _poll_cycle(
+    registry: Any, session: Any, env: Any, q: Any,
+    log_path: str, pid_path: str, exit_path: str, prev_output_bytes: int,
+) -> int:
+    """One full poll cycle; returns the new log offset. Raises on uncertain probe."""
+    prev_output_bytes = _poll_ingest_log(registry, session, env, q, log_path, prev_output_bytes)
     stored_token = getattr(session, "sandbox_run_token", "") or ""
     token_path = getattr(session, "env_token_path", "") or ""
     try:
@@ -394,70 +581,15 @@ def _poll_cycle(
         return prev_output_bytes
     except _SupervisionTransportError:
         raise
-    # Verified exit receipt FIRST: token-bound, framed (absent != failed), and
-    # identity-checked before trusting. kill -0 races the wrapper's final write.
-    try:
-        receipt = _read_exit_receipt(env, q(exit_path), stored_token)
-    except _ContainerReplacedError as exc:
-        registry._mark_supervision_unresolved(session, str(exc))
+    handled = _poll_handle_receipt(
+        registry, session, env, q, log_path, exit_path, prev_output_bytes,
+        stored_token, live_token)
+    if handled is not None:
+        return handled
+    alive = _poll_check_liveness(registry, session, env, q, pid_path, stored_token, live_token)
+    if alive is not None:
         return prev_output_bytes
-    if receipt is not None:
-        if sandbox_identity_verdict(
-                session.sandbox_container_id, session.sandbox_pid, env,
-                None, stored_token, live_token) != "match":
-            registry._mark_supervision_unresolved(
-                session, "exit receipt present but run identity unverified (refusing to trust it)")
-            return prev_output_bytes
-        try:
-            raw = _exec_probe_pinned(
-                env, registry._log_delta_command(q(log_path), prev_output_bytes),
-                timeout=10, label="final log drain")
-            header, _, delta = raw.partition("\n")
-            try:
-                size_str, _offset_str = header.split()
-                prev_output_bytes = int(size_str)
-            except ValueError:
-                pass
-            if delta:
-                with session._lock:
-                    if not session.exited:
-                        session.output_buffer += delta
-                        if len(session.output_buffer) > session.max_output_chars:
-                            session.output_buffer = session.output_buffer[-session.max_output_chars:]
-        except _SupervisionTransportError:
-            pass
-        registry._finish_env_exit(session, receipt)
-        return prev_output_bytes
-
-    # Identity-safe liveness SECOND: a replaced container is never continuity;
-    # an unknown identity is uncertainty, never an exit and never a signal.
-    verdict = sandbox_identity_verdict(
-        session.sandbox_container_id, session.sandbox_pid, env,
-        None, stored_token, live_token)
-    if verdict == "mismatch":
-        registry._mark_supervision_unresolved(
-            session, "sandbox run identity changed (replacement, not continuity)")
-        return prev_output_bytes
-    if verdict == "unknown":
-        raise _SupervisionTransportError(
-            "sandbox run identity unverifiable (no token/container continuity proof)")
-    alive_raw = _exec_probe_pinned(
-        env, f"kill -0 \"$(cat {q(pid_path)} 2>/dev/null)\" 2>/dev/null; echo $?",
-        timeout=5, label="liveness probe")
-    if alive_raw.strip().splitlines()[-1].strip() == "0":
-        return prev_output_bytes
-
-    # Dead without a receipt: cross-check the wrapper PID file before concluding
-    # anything — a changed PID file is a replacement; an unreadable backend is
-    # uncertainty, not an exit.
-    pid_value = _read_pid_file(env, q(pid_path))
-    if sandbox_identity_verdict(
-            session.sandbox_container_id, session.sandbox_pid, env, pid_value,
-            stored_token, live_token) != "match":
-        registry._mark_supervision_unresolved(
-            session, "worker unreachable and wrapper identity changed (no verified exit receipt)")
-        return prev_output_bytes
-    raise _SupervisionTransportError("worker not alive and no exit receipt yet")
+    return prev_output_bytes
 
 
 def _reconcile_or_escalate(

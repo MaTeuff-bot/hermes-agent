@@ -1,5 +1,7 @@
 """Process-tree termination and post-kill survivor verification for ProcessRegistry."""
 
+from __future__ import annotations
+
 import logging
 import os
 import signal
@@ -146,7 +148,7 @@ class ProcessTerminationMixin:
     # escalated kill as incomplete.
     _KILL_SETTLE_SECONDS = 1.0
 
-    def _post_kill_survivors(self, session: "ProcessSession") -> list[int]:
+    def _post_kill_survivors(self, session: ProcessSession) -> list[int]:
         """Host PIDs still alive once the kill signals have had time to land (#115490).
 
         Fail-closed: anything unverifiable counts as a survivor, so a kill
@@ -160,7 +162,7 @@ class ProcessTerminationMixin:
                 return survivors
             time.sleep(0.05)
 
-    def _probe_survivors(self, session: "ProcessSession") -> list[int]:
+    def _probe_survivors(self, session: ProcessSession) -> list[int]:
         survivors: list[int] = []
         proc = getattr(session, "process", None)
         if proc is not None:
@@ -189,3 +191,179 @@ class ProcessTerminationMixin:
             # reparented orphans are outside PID scope (systemd scope stop,
             # issued before this check, covers the cgroup case).
         return [pid for pid in survivors if pid]
+
+    def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
+        """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
+        PID. Returns a final result dict when the kill cannot proceed (recycled/dead
+        recovered PID, or no runtime handle), else None."""
+        if session._pty:
+            try:
+                session._pty.terminate(force=True)
+            except Exception as exc:
+                logger.debug("PTY terminate failed, falling back to SIGTERM: %s", exc, exc_info=True)
+                if session.pid:
+                    os.kill(session.pid, signal.SIGTERM)
+        elif session.process:
+            # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
+            # leaves Git Bash descendants behind.
+            self._terminate_host_pid(session.process.pid, session.host_start_time)
+        elif session.env_ref and session.pid:
+            return self._signal_kill_sandbox(session, session_id)
+        elif session.detached and session.pid_scope == "host" and session.pid:
+            return self._signal_kill_detached(session, session_id, consume_output)
+        else:
+            return {
+                # Reject non-positive timeouts — the schema declares minimum=1, but not every caller
+                # enforces schemas before dispatch. timeout=0 is falsy, so without this guard it silently
+                # fell through (`0 or max_timeout`) to the DEFAULT wait instead of erroring. Salvaged from
+                # PR #60004 (credit @isheng-eqi).
+                "status": "error",
+                "error": "Recovered process cannot be killed after restart because "
+                         "its original runtime handle is no longer available",
+            }
+        return None
+
+    def _signal_kill_sandbox(self, session: ProcessSession, session_id: str) -> Optional[dict]:
+        """Signal through the sandbox exec transport after re-verifying run identity.
+
+        Returns an error result when the live run is not provably ours; None when
+        the signal was sent and post-signal verification should decide the outcome."""
+        from tools.process_registry_supervision import (
+            _read_pid_file, _read_token_file, _read_wrapper_startticks,
+            _read_boot_id, sandbox_signal_verdict,
+            _SupervisionTransportError)
+        from tools.process_registry_supervision import pinned_launch_execute as _pinned_kill
+        import shlex as _shlex
+        try:
+            _live_pid = _read_pid_file(
+                session.env_ref, _shlex.quote(session.env_pid_path)) if session.env_pid_path else None
+        except _SupervisionTransportError as exc:
+            logger.debug("Kill %s pid read uncertain: %s", session_id, exc, exc_info=True)
+            return {"status": "error",
+                    "error": "Refusing to signal: wrapper identity unverifiable (uncertain transport)."}
+        except Exception as exc:
+            logger.debug("Kill %s pid read failed: %s", session_id, exc, exc_info=True)
+            return {"status": "error",
+                    "error": "Refusing to signal: wrapper identity unverifiable."}
+        try:
+            _live_token = _read_token_file(
+                session.env_ref, _shlex.quote(session.env_token_path)
+            ) if getattr(session, "sandbox_run_token", "") and getattr(session, "env_token_path", "") else None
+        except _SupervisionTransportError as exc:
+            logger.debug("Kill %s token read uncertain: %s", session_id, exc, exc_info=True)
+            return {"status": "error",
+                    "error": "Refusing to signal: wrapper identity unverifiable (uncertain transport)."}
+        except Exception as exc:
+            logger.debug("Kill %s token read failed: %s", session_id, exc, exc_info=True)
+            return {"status": "error",
+                    "error": "Refusing to signal: wrapper identity unverifiable."}
+        try:
+            _live_ticks = _read_wrapper_startticks(
+                session.env_ref, _shlex.quote(session.env_pid_path)) if session.env_pid_path else None
+        except _SupervisionTransportError as exc:
+            logger.debug("Kill %s start-ticks uncertain: %s", session_id, exc, exc_info=True)
+            return {"status": "error",
+                    "error": "Refusing to signal: wrapper identity unverifiable (uncertain transport)."}
+        except Exception as exc:
+            logger.debug("Kill %s start-ticks failed: %s", session_id, exc, exc_info=True)
+            return {"status": "error",
+                    "error": "Refusing to signal: wrapper identity unverifiable."}
+        try:
+            _live_boot = _read_boot_id(session.env_ref)
+        except _SupervisionTransportError as exc:
+            logger.debug("Kill %s boot-ID uncertain: %s", session_id, exc, exc_info=True)
+            return {"status": "error",
+                    "error": "Refusing to signal: wrapper identity unverifiable (uncertain transport)."}
+        except Exception as exc:
+            logger.debug("Kill %s boot-ID failed: %s", session_id, exc, exc_info=True)
+            return {"status": "error",
+                    "error": "Refusing to signal: wrapper identity unverifiable."}
+        if sandbox_signal_verdict(
+                session.sandbox_container_id, session.sandbox_pid,
+                session.env_ref, _live_pid,
+                getattr(session, "sandbox_run_token", ""), _live_token,
+                getattr(session, "sandbox_wrapper_startticks", "") or "", _live_ticks,
+                getattr(session, "sandbox_boot_id", "") or "",
+                _live_boot if isinstance(_live_boot, str) else None) != "match":
+            return {
+                "status": "error",
+                "error": "Refusing to signal: the sandbox run identity changed or is "
+                         "unverifiable (container replaced, token mismatch, or wrapper "
+                         "PID reused by an unrelated process). "
+                         "The recorded PID may belong to an unrelated process.",
+            }
+        try:
+            _pinned_kill(session.env_ref, f"kill {int(session.pid)} 2>/dev/null", timeout=5)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Sandbox kill transport failed for %s: %s", session_id, exc, exc_info=True)
+            return {"status": "error",
+                    "error": f"Kill signal not confirmed for {session_id}: {exc}"}
+        except Exception as exc:
+            logger.warning("Sandbox kill failed for %s: %s", session_id, exc, exc_info=True)
+            return {"status": "error",
+                    "error": f"Kill signal not confirmed for {session_id}: {exc}"}
+        return self._verify_sandbox_kill(session, session_id)
+
+    def _verify_sandbox_kill(self, session: ProcessSession, session_id: str) -> Optional[dict]:
+        """Post-signal probe: a still-identical wrapper means the signal did not land.
+
+        Fail-closed: an unverifiable wrapper is never claimed killed. Returns an
+        error result on a proven-live or proven-reused wrapper, else None."""
+        from tools.process_registry_supervision import (
+            _read_wrapper_startticks, _SupervisionTransportError,
+            _exec_probe_pinned as _probe)
+        import shlex as _shlex
+        try:
+            from tools.process_registry_supervision import _exec_probe_pinned as _probe
+            _alive_after = _probe(
+                session.env_ref,
+                f"kill -0 \"$(cat {_shlex.quote(session.env_pid_path)} 2>/dev/null)\" 2>/dev/null; echo $?",
+                5, label="kill verify")
+            if _alive_after.strip().splitlines()[-1].strip() == "0":
+                try:
+                    _ticks_after = _read_wrapper_startticks(
+                        session.env_ref, _shlex.quote(session.env_pid_path))
+                except Exception as exc:
+                    logger.debug("Kill verify start-ticks uncertain for %s: %s",
+                                 session_id, exc, exc_info=True)
+                    _ticks_after = None
+                stored_ticks = getattr(session, "sandbox_wrapper_startticks", "") or ""
+                if _ticks_after is None:
+                    return {"status": "error",
+                            "error": f"Kill signal sent to {session_id} but wrapper liveness unverifiable; not claimed killed."}
+                if _ticks_after == stored_ticks:
+                    return {"status": "error",
+                            "error": f"Kill signal sent to {session_id} but wrapper still alive; not claimed killed."}
+                return {"status": "error",
+                        "error": f"Kill signal sent to {session_id} but wrapper identity changed (PID reused); not claimed killed."}
+        except _SupervisionTransportError as exc:
+            logger.debug("Kill verify uncertain for %s: %s", session_id, exc, exc_info=True)
+        except Exception as exc:
+            logger.debug("Kill verify failed for %s: %s", session_id, exc, exc_info=True)
+
+    def _signal_kill_detached(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
+        """Kill a recovered host-PID session whose live identity was just proven."""
+        from tools.process_registry import _completion_output
+        # Same fate as poll/list: a gone or reused PID means our process is
+        # gone — never tree-kill the stranger — but a live PID with an
+        # unreadable start time is still ours and must really be killed.
+        # If this recovered session also carries an owned systemd scope, stop that scope before
+        # returning: a daemonized descendant may still be alive there even though the wrapper PID exited
+        # or was recycled across the gateway restart (#70716, teknium1 review).
+        if self._detached_host_fate(session.pid, session.host_start_time) != "running":
+            scope_stopped = self._stop_scope(session)
+            with session._lock:
+                output = _completion_output(session)
+            if consume_output:
+                self._completion_consumed.add(session_id)
+            # No waitable handle, so this is not a collected exit. Close the
+            # entry without queueing a completion, and do not signal a PID
+            # whose start time does not match.
+            self._close_reused_detached(session)
+            result = {"status": "already_exited", "exit_code": session.exit_code, **output}
+            if not scope_stopped:
+                result["scope_stop_failed"] = session.systemd_unit
+            return result
+        # Identity was just proven above. Re-passing the start time would make
+        # an unreadable probe refuse the kill and leave the re-adopted child running.
+        self._terminate_host_pid(session.pid)

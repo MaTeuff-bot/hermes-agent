@@ -9,7 +9,7 @@ adapter/model transports. No live Slack, no Docker engine.
 Covers the supervision contract end to end:
 - transient transport outage mid-job launches once, delivers the true receipt
   into the owning session turn (admission, not a mocked handler);
-- nonzero and wrapper-budget timeout route the same way (non-success, honest);
+- nonzero and caller-owned timeout route the same way (non-success, honest);
 - duplicate/replayed completions admit at most once;
 - ``SendResult(success=False)`` retries durably until ack, never silently acked;
 - pending-delivery replay after restart (absent checkpoint) rebuilds the
@@ -204,12 +204,13 @@ def test_nonzero_exit_routes_honestly_once(monkeypatch, isolated_home):
         _cleanup(session)
 
 
-def test_budget_timeout_routes_as_non_success(monkeypatch, isolated_home):
-    """Wrapper-owned budget fires without polling: 124/budget_timeout, routed once."""
+def test_caller_owned_timeout_routes_as_non_success(monkeypatch, isolated_home):
+    """Caller-owned timeout (124) routes as non-success once via the real handler."""
     _short_supervision(monkeypatch)
     registry = isolated_home
     env = SandboxLikeEnv()
-    session = registry.spawn_via_env(env, "sleep 5", timeout=15, budget_seconds=1)
+    session = registry.spawn_via_env(
+        env, "timeout -s TERM -k 1 1 bash -lc 'sleep 5'", timeout=15)
     session.session_key = "agent:main:telegram:dm:123"
     session.watcher_platform = "telegram"
     session.watcher_chat_id = "123"
@@ -219,14 +220,13 @@ def test_budget_timeout_routes_as_non_success(monkeypatch, isolated_home):
     try:
         assert _wait_for(lambda: session.exited, timeout=20.0)
         assert session.exit_code == 124
-        assert session.completion_reason == "budget_timeout"
+        assert session.completion_reason == "exited"
         adapter = SimpleNamespace(send=AsyncMock(return_value=SendResult(success=True)), handle_message=AsyncMock())
         runner = _runner(adapter, session_db=_SessionDB({"ended_at": None}))
         _run_watcher_sync(monkeypatch, runner, _watcher_for(session.id))
         assert adapter.handle_message.await_count == 1
     finally:
         _cleanup(session)
-
 
 def test_duplicate_replayed_completion_admits_once(monkeypatch, isolated_home):
     """Same producer identity twice: at most one admitted turn, second deduped."""

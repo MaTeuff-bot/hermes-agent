@@ -35,6 +35,7 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import format_process_notification, is_child_process_notification, should_surface_notification
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
+from tools.process_registry_sandbox import ProcessSandboxMixin
 from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
 from tools.process_registry_env_log import log_delta_command
@@ -575,12 +576,15 @@ class ProcessSession:
     env_token_path: str = ""
     sandbox_pid: Optional[int] = None
     sandbox_run_token: str = ""
+    sandbox_wrapper_startticks: str = ""
+    sandbox_boot_id: str = ""
+    env_start_path: str = ""
+    env_boot_path: str = ""
     # Durable supervision: "ok" | "degraded" (transient probe failures, retrying) |
     # "unresolved" (retry bound exhausted; retained with evidence, never a faked exit).
     supervision_state: str = "ok"
     supervision_failures: int = 0
     last_supervision_error: str = ""
-    process_budget_seconds: int = 0             # wrapper-owned job budget; 0 = unbounded
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
     wsl_chain: bool = False                     # spawned via wsl[.exe]: the host PID is the short-lived
                                                 # launcher; Linux-side workers outlive it (#120546)
@@ -678,9 +682,10 @@ _CHECKPOINT_FIELDS = (
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
     "heartbeat_seconds", "persist_on_release", "output_log",
     "sandbox_container_id", "sandbox_backend", "env_log_path", "env_pid_path",
-    "env_exit_path", "env_token_path", "sandbox_pid", "sandbox_run_token",
-    "supervision_state", "supervision_failures",
-    "last_supervision_error", "process_budget_seconds")
+    "env_exit_path", "env_token_path", "env_start_path", "env_boot_path",
+    "sandbox_pid", "sandbox_run_token", "sandbox_wrapper_startticks",
+    "sandbox_boot_id", "supervision_state", "supervision_failures",
+    "last_supervision_error")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -695,7 +700,7 @@ _WSL_CHAIN_NOTE = (
 )
 
 
-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin):
+class ProcessRegistry(ProcessSandboxMixin, ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
@@ -1298,64 +1303,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         self._track_started(session, self._reader_loop, f"proc-reader-{session.id}")
         return session
 
-    def spawn_via_env(
-        self, env: Any, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False,
-        budget_seconds: int | None = None) -> ProcessSession:
-        """Spawn a background process inside a non-local backend's sandbox.
-        The command is wrapped to capture its in-sandbox PID and redirect output to a
-        log file that later execute() calls poll. No live pipe or stdin, but it runs in
-        the correct sandbox context. ``persist_on_release`` keeps the process out of
-        agent-lifecycle kill sweeps (#41225). ``timeout`` is the transport/start
-        timeout only, never the job budget; ``budget_seconds`` is a wrapper-owned job
-        budget (GNU ``timeout``; exit 124, recorded as ``budget_timeout``) that holds
-        even when nobody polls."""
-        from tools.process_registry_supervision import budget_wrapper_inner, capture_sandbox_identity, pinned_launch_execute
-        import secrets as _secrets
-        session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
-                                    persist_on_release=persist_on_release)
-        container_id, backend = capture_sandbox_identity(env)
-        session.sandbox_container_id = container_id
-        session.sandbox_backend = backend
-        session.process_budget_seconds = int(budget_seconds or 0)
-        run_token = _secrets.token_hex(8)
-        session.sandbox_run_token = run_token
-        temp_dir = self._env_temp_dir(env)
-        log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
-        token_path = f"{temp_dir}/hermes_bg_{session.id}.token"
-        session.env_log_path, session.env_pid_path, session.env_exit_path = log_path, pid_path, exit_path
-        session.env_token_path = token_path
-        q = shlex.quote
-        bg_command = (
-            f"mkdir -p {q(temp_dir)} && "
-            f"printf '%s\\n' {q(run_token)} > {q(token_path)} && "
-            f"( nohup {budget_wrapper_inner(command, budget_seconds, q)} > {q(log_path)} 2>&1; "
-            f"rc=$?; printf '%s\\n%s\\n' {q(run_token)} \"$rc\" > {q(exit_path)}.tmp && "
-            f"mv {q(exit_path)}.tmp {q(exit_path)} ) & "
-            f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
-        try:
-            result = pinned_launch_execute(env, bg_command, timeout=timeout, rewrite_compound_background=False)
-            output = result.get("output", "").strip()
-            session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
-            session.sandbox_pid = session.pid
-            # No PID from the wrapper (syntax error, broken redirect): a failed launch,
-            # not a fake running session.
-            if session.pid is None:
-                session.mark_exited(int(result.get("returncode", -1)) or -1, "failed_start", "failed_start")
-                session.output_buffer = output
-        except Exception as e:
-            session.mark_exited(-1, "failed_start", "failed_start")
-            session.output_buffer = f"Failed to start: {e}"
-        if session.exited:
-            with self._lock:
-                self._prune_if_needed()
-        else:
-            self._track_started(
-                session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
-        return session
-
-    # ----- Reader / Poller Threads -----
-
     def _reader_loop(self, session: ProcessSession):
         """Background thread: read stdout from a local Popen process.
         ``buffer.read1(4096)`` not ``TextIOWrapper.read(4096)``: on pipes the latter
@@ -1482,82 +1429,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         from tools.process_registry_supervision import run_env_supervision
         run_env_supervision(self, session, env, log_path, pid_path, exit_path)
 
-    def _finish_env_exit(self, session: ProcessSession, exit_code: int) -> None:
-        """Finish on a verified wrapper exit receipt (a raced kill keeps its own)."""
-        from tools.process_registry_supervision import budget_completion_reason
-        reason, source = budget_completion_reason(exit_code, session.process_budget_seconds)
-        self._finish_exited(session, exit_code, reason=reason, source=source)
-
-    def _note_supervision_degraded(self, session: ProcessSession, error: str, failures: int) -> None:
-        """Record one uncertain cycle; the session keeps running and retrying."""
-        with session._lock:
-            if session.exited:
-                return
-            session.supervision_state = "degraded"
-            session.supervision_failures = failures
-            session.last_supervision_error = error[:300]
-
-    def _mark_supervision_unresolved(self, session: ProcessSession, error: str) -> None:
-        """Durable escalation: the retry bound is exhausted (or identity changed) with
-        no verified exit. The session stays tracked with its evidence — checkpointed,
-        visible to poll(), surfaced once by the gateway watcher — and is never finished
-        with an invented exit code. ``reattach_env_session`` can still resume it."""
-        with session._lock:
-            if session.exited:
-                return
-            session.supervision_state = "unresolved"
-            session.supervision_failures += 1
-            session.last_supervision_error = error[:300]
-            session.completion_reason = "unresolved"
-            session.termination_source = "backend_unreachable"
-        logger.warning("Background process %s supervision unresolved: %s", session.id, error)
-        self._write_checkpoint()
-
-    def reattach_env_session(self, session_id: str, env: Any) -> bool:
-        """Resume supervision of an ``unresolved`` sandbox session through a live env
-        handle after a registry/gateway restart. Identity (container ID, wrapper PID
-        file) must match the checkpointed run: a replacement is refused and stays
-        ``unresolved``. Backend reads here never recreate or relaunch work. True when
-        the poller resumes."""
-        from tools.process_registry_supervision import (
-            _read_pid_file, _read_token_file, sandbox_identity_verdict)
-        import shlex
-        session = self.get(session_id)
-        if session is None or session.exited or session.pid_scope != "sandbox":
-            return False
-        if session.env_ref is None:
-            session.env_ref = env
-        try:
-            pid_value = _read_pid_file(env, shlex.quote(session.env_pid_path))
-        except Exception:
-            return False
-        live_token = None
-        if getattr(session, "sandbox_run_token", "") and getattr(session, "env_token_path", ""):
-            try:
-                live_token = _read_token_file(env, shlex.quote(session.env_token_path))
-            except Exception:
-                return False
-        if sandbox_identity_verdict(
-                session.sandbox_container_id, session.sandbox_pid, env, pid_value,
-                getattr(session, "sandbox_run_token", ""), live_token) != "match":
-            logger.warning(
-                "Refusing to reattach %s: live backend identity does not match the checkpointed run",
-                session_id)
-            return False
-        with session._lock:
-            session.supervision_state = "ok"
-            session.supervision_failures = 0
-            session.last_supervision_error = ""
-            session.completion_reason = "exited"
-            session.termination_source = ""
-            session._supervision_generation += 1
-            session._unresolved_surfaced = False
-        self._track_started(
-            session, self._env_poller_loop, f"proc-poller-{session.id}",
-            (env, session.env_log_path, session.env_pid_path, session.env_exit_path))
-        logger.info("Resumed supervision of %s in its original sandbox", session_id)
-        return True
-
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
         pty = session._pty
@@ -1640,14 +1511,34 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             if was_running:
                 session._finish_claimed = True
                 session.exited_at = time.time()
-                # Keep the session tracked until its result is durable. A finite
-                # parent must not observe completion and exit during this write.
-                save_completed_result(session)
+                # Durable outbox precedes the query-only result save and any
+                # finalized-state exposure: a crash between them must leave a
+                # recoverable pending event, never a silent loss. Disk failures
+                # are visible (warning with traceback), never swallowed.
                 try:
                     from tools.process_registry_delivery import write_pending_delivery
-                    write_pending_delivery(session)
+                    outbox_ok = bool(write_pending_delivery(session))
                 except Exception:
-                    pass
+                    logger.warning(
+                        "Pending-delivery outbox write failed for %s; result not yet saved",
+                        session.id, exc_info=True)
+                    outbox_ok = False
+                if not outbox_ok and (
+                        getattr(session, "watcher_interval", 0) > 0
+                        or getattr(session, "notify_on_complete", False)):
+                    logger.warning(
+                        "Outbox not durable for %s; keeping session running for retry, not finished",
+                        session.id)
+                    session._finish_claimed = False
+                    return False
+                try:
+                    save_completed_result(session)
+                except Exception:
+                    logger.warning(
+                        "Result save failed for %s after outbox write; staying running",
+                        session.id, exc_info=True)
+                    session._finish_claimed = False
+                    return False
                 self._running.pop(session.id)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
@@ -2323,88 +2214,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         stopped = _stop_systemd_unit(session.systemd_unit)
         session._scope_stop_pending = not stopped
         return stopped
-
-    def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
-        """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
-        PID. Returns a final result dict when the kill cannot proceed (recycled/dead
-        recovered PID, or no runtime handle), else None."""
-        if session._pty:
-            try:
-                session._pty.terminate(force=True)
-            except Exception:
-                if session.pid:
-                    os.kill(session.pid, signal.SIGTERM)
-        elif session.process:
-            # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
-            # leaves Git Bash descendants behind.
-            self._terminate_host_pid(session.process.pid, session.host_start_time)
-        elif session.env_ref and session.pid:
-            from tools.process_registry_supervision import (
-                _read_pid_file, _read_token_file, sandbox_identity_verdict)
-            import shlex as _shlex
-            _live_pid = None
-            if session.env_pid_path:
-                try:
-                    _live_pid = _read_pid_file(session.env_ref, _shlex.quote(session.env_pid_path))
-                except Exception:
-                    _live_pid = None
-            _live_token = None
-            if getattr(session, "sandbox_run_token", "") and getattr(session, "env_token_path", ""):
-                try:
-                    _live_token = _read_token_file(
-                        session.env_ref, _shlex.quote(session.env_token_path))
-                except Exception:
-                    _live_token = None
-            if sandbox_identity_verdict(
-                    session.sandbox_container_id, session.sandbox_pid,
-                    session.env_ref, _live_pid,
-                    getattr(session, "sandbox_run_token", ""), _live_token) != "match":
-                return {
-                    "status": "error",
-                    "error": "Refusing to signal: the sandbox run identity changed or is "
-                             "unverifiable (container replaced or wrapper PID file mismatch). "
-                             "The recorded PID may belong to an unrelated process.",
-                }
-            try:
-                from tools.process_registry_supervision import pinned_launch_execute as _pinned_kill
-                _pinned_kill(session.env_ref, f"kill {session.pid} 2>/dev/null", timeout=5)
-            except Exception:
-                pass
-        elif session.detached and session.pid_scope == "host" and session.pid:
-            # Same fate as poll/list: a gone or reused PID means our process is
-            # gone — never tree-kill the stranger — but a live PID with an
-            # unreadable start time is still ours and must really be killed.
-            # If this recovered session also carries an owned systemd scope, stop that scope before
-            # returning: a daemonized descendant may still be alive there even though the wrapper PID exited
-            # or was recycled across the gateway restart (#70716, teknium1 review).
-            if self._detached_host_fate(session.pid, session.host_start_time) != "running":
-                scope_stopped = self._stop_scope(session)
-                with session._lock:
-                    output = _completion_output(session)
-                if consume_output:
-                    self._completion_consumed.add(session_id)
-                # No waitable handle, so this is not a collected exit. Close the
-                # entry without queueing a completion, and do not signal a PID
-                # whose start time does not match.
-                self._close_reused_detached(session)
-                result = {"status": "already_exited", "exit_code": session.exit_code, **output}
-                if not scope_stopped:
-                    result["scope_stop_failed"] = session.systemd_unit
-                return result
-            # Identity was just proven above. Re-passing the start time would make
-            # an unreadable probe refuse the kill and leave the re-adopted child running.
-            self._terminate_host_pid(session.pid)
-        else:
-            return {
-                # Reject non-positive timeouts — the schema declares minimum=1, but not every caller
-                # enforces schemas before dispatch. timeout=0 is falsy, so without this guard it silently
-                # fell through (`0 or max_timeout`) to the DEFAULT wait instead of erroring. Salvaged from
-                # PR #60004 (credit @isheng-eqi).
-                "status": "error",
-                "error": "Recovered process cannot be killed after restart because "
-                         "its original runtime handle is no longer available",
-            }
-        return None
 
     def _stdin_op(self, session_id: str, pty_op, pipe_op, ok: dict) -> dict:
         """Run a stdin operation on a running session — ``pty_op(pty)`` under PTY mode,

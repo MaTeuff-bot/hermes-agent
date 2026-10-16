@@ -243,31 +243,98 @@ def test_a_reader_exit_during_a_failed_scope_stop_is_not_reported_as_killed(monk
 
 
 class _SandboxEnv:
-    """Non-local backend double: answers the poller's log-delta, liveness and exit-code reads,
-    running ``hooks[step]`` first so a test can land a kill at an exact point."""
+    """Current-contract backend double: framed log-delta, token, token-bound exit
+    receipt, ``kill -0`` liveness, plus ``/proc`` startticks and boot ID for kill
+    identity. Runs ``hooks[step]`` once so a test can land a kill at an exact
+    point (``delta``/``exit``/``check``). ``receipt=None`` means no exit file yet
+    (``__NO_RECEIPT__``); otherwise the receipt is ``"<token>\\n<code>\\n"``.
+    The ``kill <pid>`` signal flips ``alive`` to False so post-kill verification
+    observes the death instead of claiming a survivor."""
 
-    def __init__(self, *, delta="", alive=False, hooks=None):
-        self.delta, self.alive, self.hooks = delta, alive, hooks or {}
+    def __init__(self, *, delta="", alive=False, hooks=None, receipt=None,
+                 token="tok-run-a", pid=4242, container="ctr-test",
+                 ticks="12345", boot="boot-test-1111"):
+        self.delta = delta
+        self.alive = alive
+        self.hooks = dict(hooks or {})
+        self.receipt = receipt
+        self.token = token
+        self.pid = pid
+        self.ticks = ticks
+        self.boot = boot
+        self._container_id = container
+        self.commands = []
+
+    def _stat_output(self):
+        fields = ["S", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+                  "11", "12", "13", "14", "15", "16", "17", "18",
+                  self.ticks, "20", "21"]
+        return f"{self.pid} (bash) {' '.join(fields)}\n"
 
     def execute(self, command, **_kwargs):
-        if command.startswith("kill -0"):
-            step, out = "check", "0\n" if self.alive else "1\n"
-        elif command.startswith("kill "):
-            return {"output": ""}
-        elif command.startswith("cat "):
-            step, out = "exit", "0\n"
-        else:
-            step, out = "delta", f"{len(self.delta.encode())} 0\n{self.delta}"
-        hook = self.hooks.pop(step, None)
-        if hook:
-            hook()
-        return {"output": out}
+        self.commands.append(command)
+        if "boot_id" in command:
+            return {"output": f"{self.boot}\n", "returncode": 0}
+        if "/proc/" in command and "/stat" in command:
+            return {"output": self._stat_output(), "returncode": 0}
+        if ".token" in command:
+            return {"output": f"{self.token}\n", "returncode": 0}
+        if command.startswith("if [ -f"):
+            hook = self.hooks.pop("exit", None)
+            if hook is not None:
+                hook()
+            if self.receipt is None:
+                return {"output": "__NO_RECEIPT__\n", "returncode": 0}
+            return {"output": f"{self.token}\n{int(self.receipt)}\n", "returncode": 0}
+        if "kill -0" in command:
+            hook = self.hooks.pop("check", None)
+            if hook is not None:
+                hook()
+            return {"output": "0\n" if self.alive else "1\n", "returncode": 0}
+        if command.startswith("kill "):
+            self.alive = False
+            return {"output": "", "returncode": 0}
+        if command.startswith("O="):
+            hook = self.hooks.pop("delta", None)
+            if hook is not None:
+                hook()
+            try:
+                offset = int(command[2:].split(";", 1)[0].strip())
+            except ValueError:
+                offset = 0
+            total = len(self.delta.encode())
+            offset = max(offset, 0)
+            if offset >= total:
+                return {"output": f"{total} {min(offset, total)}\n", "returncode": 0}
+            tail = self.delta[offset:]
+            return {"output": f"{total} {offset}\n{tail}", "returncode": 0}
+        if command.startswith("cat ") and ".pid" in command:
+            return {"output": f"{self.pid}\n", "returncode": 0}
+        return {"output": "", "returncode": 0}
 
 
 def _sandbox_session(registry, monkeypatch, env) -> ProcessSession:
-    session = _session("proc_sandbox", pid=4242, pid_scope="sandbox", env_ref=env, notify_on_complete=True)
+    session = _session(
+        "proc_sandbox", pid=env.pid, pid_scope="sandbox", env_ref=env,
+        notify_on_complete=True,
+        sandbox_container_id=env._container_id,
+        sandbox_backend=type(env).__name__,
+        sandbox_pid=env.pid,
+        sandbox_run_token=env.token,
+        sandbox_wrapper_startticks=env.ticks,
+        sandbox_boot_id=env.boot,
+        env_log_path="/tmp/bg.log",
+        env_pid_path="/tmp/bg.pid",
+        env_exit_path="/tmp/bg.exit",
+        env_token_path="/tmp/bg.token",
+    )
     registry._running[session.id] = session
     monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    try:
+        import tools.process_registry_supervision as _sup
+        monkeypatch.setattr(_sup.time, "sleep", lambda _s: None)
+    except Exception:
+        pass
     monkeypatch.setattr(registry, "_write_checkpoint", lambda *_a, **_k: None)
     monkeypatch.setattr(registry, "_post_kill_survivors", lambda _session: [])
     return session
@@ -278,9 +345,10 @@ def _poll_sandbox(registry, session, env):
 
 
 def test_a_sandbox_exit_read_after_a_kill_keeps_the_kill(monkeypatch):
+    """Kill-wins over a token-bound exit receipt that arrives in the same cycle."""
     registry = ProcessRegistry()
     killed = []
-    env = _SandboxEnv(hooks={"exit": lambda: killed.append(registry.kill_process("proc_sandbox"))})
+    env = _SandboxEnv(receipt=0, hooks={"exit": lambda: killed.append(registry.kill_process("proc_sandbox"))})
     session = _sandbox_session(registry, monkeypatch, env)
 
     _poll_sandbox(registry, session, env)
@@ -307,6 +375,13 @@ def test_a_sandbox_lost_after_a_kill_keeps_the_kill(monkeypatch):
 
 
 def test_a_lost_sandbox_without_a_kill_is_reported_lost(monkeypatch):
+    """Transport loss is durable ``unresolved``, never a faked ``-1/lost`` exit.
+
+    Legacy contract invented ``exit -1 / lost / backend_lost`` on any poll
+    exception. Current supervision retries bounded with backoff and escalates to
+    ``unresolved`` with retained evidence: no invented exit code, no relaunch,
+    session stays tracked for ``reattach_env_session``.
+    """
     registry = ProcessRegistry()
 
     def lose_the_backend():
@@ -317,10 +392,15 @@ def test_a_lost_sandbox_without_a_kill_is_reported_lost(monkeypatch):
 
     _poll_sandbox(registry, session, env)
 
-    assert (session.exit_code, session.completion_reason, session.termination_source) == (
-        -1, "lost", "backend_lost")
-    assert session.id in registry._finished
-    assert session._completion_event.is_set()
+    assert session.supervision_state == "unresolved"
+    assert session.completion_reason == "unresolved"
+    assert session.termination_source == "backend_unreachable"
+    assert session.exit_code is None, "unresolved must not invent an exit code"
+    assert not session.exited, "unresolved run must not be finished"
+    assert session.id in registry._running, "unresolved stays tracked for reattach"
+    assert session.id not in registry._finished
+    assert not session._completion_event.is_set()
+    assert session.last_supervision_error, "evidence for operator triage required"
 
 
 def test_sandbox_output_fetched_before_a_kill_is_not_added_after_it(monkeypatch):

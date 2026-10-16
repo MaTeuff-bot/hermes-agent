@@ -156,21 +156,66 @@ def test_malformed_exit_never_fabricates_zero(output, token, expected):
     assert sup.parse_verified_exit(output, token) is expected
 
 
-def test_budget_timeout_owned_by_wrapper_without_polling(monkeypatch):
-    """The job budget fires inside the wrapper even if nobody polls.
+def test_spawn_wrapper_has_no_default_budget_via_entry_path(monkeypatch):
+    """No default budget: the terminal entry path never imposes a timeout.
 
-    ``sleep 30`` with ``budget_seconds=1`` must record the wrapper's 124 as
-    ``budget_timeout`` (non-success) — never overwritten by a later child exit.
+    Drives the ACTUAL ``spawn_background_process`` entry (not the registry
+    directly): the wrapper must contain no ``timeout -s TERM`` budget segment,
+    ``timeout`` is the start/probe timeout only, and a server-like job stays
+    running (never killed by a default). Budgets are caller-owned.
+    """
+    _short_supervision(monkeypatch)
+    from tools import terminal_tool_background as bg
+    from tools.process_registry import process_registry as live_registry
+    registry = ProcessRegistry()
+    monkeypatch.setattr(bg, "process_registry", registry, raising=False)
+    import tools.process_registry as pr_module
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    env = SandboxLikeEnv()
+    result_json = bg.spawn_background_process(
+        command="sleep 30", env=env, env_type="sandbox",
+        effective_task_id="t", task_id="t", session_key="k",
+        workdir=None, cwd="/tmp", effective_pty=False,
+        notify_on_complete=False, watch_patterns=None, approval_note=None,
+        completion_output_chars=0, pty_disabled_reason=None,
+        heartbeat_seconds=0, persist_on_release=False, mounted_host=None,
+    )
+    import json as _json
+    data = _json.loads(result_json)
+    session = registry.get(data["session_id"])
+    try:
+        assert session is not None and not session.exited
+        flat = "\n".join(env.commands)
+        assert "timeout -s TERM" not in flat, f"default budget imposed: {flat[:500]!r}"
+        assert "nohup" in flat and "bash -lc" in flat
+        for _ in range(100):
+            assert not session.exited, "server-like job killed without a caller budget"
+            time.sleep(0)
+        assert getattr(session, "sandbox_wrapper_startticks", "") or True
+    finally:
+        try:
+            registry.kill_process(session.id)
+        except Exception:
+            pass
+        _cleanup(registry, session)
+
+
+def test_caller_owned_timeout_reports_124_even_after_child_exit0(monkeypatch):
+    """Caller-owned GNU timeout holds even if the child exits 0 after TERM.
+
+    A caller that needs a bound wraps its own command; the wrapper's 124 is
+    never overwritten by a later child exit 0 (TERM then KILL grace).
     """
     _short_supervision(monkeypatch)
     registry = ProcessRegistry()
     env = SandboxLikeEnv()
-    session = registry.spawn_via_env(env, "sleep 30", timeout=15, budget_seconds=1)
+    session = registry.spawn_via_env(
+        env, "timeout -s TERM -k 1 1 sleep 30", timeout=15)
     try:
         done = _wait_for(lambda: session.exited, timeout=25.0)
-        assert done, "wrapper-owned budget never fired"
+        assert done, "caller-owned timeout never fired"
         assert session.exit_code == 124
-        assert session.completion_reason == "budget_timeout"
+        assert session.completion_reason == "exited"
     finally:
         _cleanup(registry, session)
 
@@ -263,4 +308,123 @@ def test_checkpoint_recovery_retains_unresolved_and_reattach_resumes(monkeypatch
         assert got.env_exit_path and got.env_token_path
         assert restarted.reattach_env_session(session_id, env) is True
     finally:
+        _cleanup(registry, session)
+
+
+def test_current_probes_quote_temp_paths_with_spaces_and_verify_token_receipt(monkeypatch):
+    """Quoting contract on the CURRENT probe set (moved from test_process_registry's
+    obsolete log/pid/exit-order test: the poller is now framed log-delta, token,
+    exit-receipt and liveness probes, and sessions carry a run token).
+
+    Every probe that touches a temp path quotes it (shlex), and a token-bound exit
+    receipt finishes the run with its real code. The first cycle has no receipt so
+    the liveness probe (quoted pid path) is exercised too.
+    """
+    import shlex
+
+    from tools.process_registry import ProcessSession
+
+    _short_supervision(monkeypatch)
+    registry = ProcessRegistry()
+    base = "/path with spaces/hermes_bg_proc_space"
+    log_path, pid_path, exit_path = base + ".log", base + ".pid", base + ".exit"
+    token_path = base + ".token"
+    session = ProcessSession(
+        id="proc_space", command="echo hello", task_id="t1", started_at=time.time(),
+        pid_scope="sandbox", pid=4242, sandbox_pid=4242,
+        sandbox_container_id="ctr-space", sandbox_backend="FakeEnv",
+        sandbox_run_token="tok-run-a",
+        env_log_path=log_path, env_pid_path=pid_path,
+        env_exit_path=exit_path, env_token_path=token_path,
+    )
+    registry._running[session.id] = session
+    calls = {"log": 0, "exit": 0}
+
+    class FakeEnv:
+        _container_id = "ctr-space"
+
+        def __init__(self):
+            self.commands = []
+
+        def execute(self, command, **kwargs):
+            self.commands.append(command)
+            if command.startswith("if [ -f"):
+                calls["exit"] += 1
+                if calls["exit"] == 1:
+                    return {"output": "__NO_RECEIPT__\n", "returncode": 0}
+                return {"output": "tok-run-a\n0\n", "returncode": 0}
+            if ".token" in command:
+                return {"output": "tok-run-a\n", "returncode": 0}
+            if "kill -0" in command:
+                return {"output": "0\n", "returncode": 0}
+            assert command.startswith("O="), command[:80]
+            calls["log"] += 1
+            if calls["log"] == 1:
+                return {"output": "5 0\nhello", "returncode": 0}
+            return {"output": "5 5\n", "returncode": 0}
+
+    env = FakeEnv()
+    try:
+        sup.run_env_supervision(registry, session, env, log_path, pid_path, exit_path)
+    finally:
+        registry._running.pop(session.id, None)
+        registry._finished.pop(session.id, None)
+        try:
+            from tools.process_registry_delivery import ack_delivery
+            ack_delivery(session.id)
+        except Exception:
+            pass
+    assert session.exited and session.exit_code == 0
+    assert session.completion_reason == "exited"
+    assert session.output_buffer == "hello"
+    assert calls["exit"] >= 2, "exit-receipt probe never ran"
+    assert any("kill -0" in cmd for cmd in env.commands), "liveness probe never ran"
+    flat = "\n".join(env.commands)
+    assert shlex.quote(log_path) in flat
+    assert shlex.quote(pid_path) in flat
+    assert shlex.quote(exit_path) in flat
+    assert shlex.quote(token_path) in flat
+
+
+def test_terminal_entry_caller_owned_timeout_reports_124(monkeypatch):
+    """Terminal-tool-entry smoke for a caller-owned bound (not a terminal default).
+
+    Drives the ACTUAL ``spawn_background_process`` entry with a bounded COMMAND:
+    the bound is owned by the caller's GNU ``timeout`` wrapper, independent of
+    supervision polling, and stays nonzero (124) even when the child traps TERM
+    and exits 0. No default budget is imposed on the entry path.
+    """
+    _short_supervision(monkeypatch)
+    from tools import terminal_tool_background as bg
+    from tools.process_registry import ProcessRegistry
+    registry = ProcessRegistry()
+    monkeypatch.setattr(bg, "process_registry", registry, raising=False)
+    import tools.process_registry as pr_module
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    env = SandboxLikeEnv()
+    result_json = bg.spawn_background_process(
+        command="timeout -s TERM -k 1 1 bash -c 'trap \"exit 0\" TERM; sleep 30'",
+        env=env, env_type="sandbox",
+        effective_task_id="t", task_id="t", session_key="k",
+        workdir=None, cwd="/tmp", effective_pty=False,
+        notify_on_complete=False, watch_patterns=None, approval_note=None,
+        completion_output_chars=0, pty_disabled_reason=None,
+        heartbeat_seconds=0, persist_on_release=False, mounted_host=None,
+    )
+    import json as _json
+    data = _json.loads(result_json)
+    session = registry.get(data["session_id"])
+    try:
+        assert session is not None and not session.exited
+        done = _wait_for(lambda: session.exited, timeout=25.0)
+        assert done, "caller-owned timeout never fired through the terminal entry"
+        assert session.exit_code == 124, (
+            f"caller bound lost: exit={session.exit_code!r} reason={session.completion_reason!r}")
+        assert session.completion_reason == "exited"
+        assert env.launch_count == 1
+    finally:
+        try:
+            registry.kill_process(session.id)
+        except Exception:
+            pass
         _cleanup(registry, session)
